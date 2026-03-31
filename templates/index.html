@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8"><title>Trading Bot Terminal</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body{background-color:#121212;color:#e0e0e0;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;} 
+        .card{background-color:#1e1e1e;border:1px solid #333;} 
+        .text-success{color:#00e676!important;} .text-danger{color:#ff1744!important;} 
+        .table{color:#e0e0e0; font-size: 0.9rem;} .table-dark{background-color:#1e1e1e;} 
+        .table-dark th{border-color:#333;color:#9e9e9e;} .table-dark td{border-color:#333;vertical-align:middle;} 
+        .badge-open{background-color:#2962ff;} .badge-dca{background-color:#ff9100;}
+        .chart-container { position: relative; height: 180px; width: 100%; }
+        .card-header { background-color: #252525; color: #ffffff !important; font-weight: bold; border-bottom: 1px solid #444; }
+        .fees-text { color: #ffab00; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark" style="background-color: #1a1a1a; border-bottom: 1px solid #333;">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="/">🤖 AlgoBot Dashboard</a>
+        <div class="d-flex align-items-center">
+            <span class="me-4" style="font-size: 1.1rem;">Баланс: <strong class="text-success" id="equityDisplay">$0.00</strong></span>
+            <a href="/settings" class="btn btn-sm btn-outline-secondary">⚙️ Настройки</a>
+        </div>
+    </div>
+</nav>
+
+<div class="container-fluid mt-3">
+    <div class="row mb-3">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header py-2">ДИНАМИКА NET PNL (USDT)</div>
+                <div class="card-body p-2 chart-container"><canvas id="pnlChart"></canvas></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-md-3">
+            <div class="card mb-4">
+                <div class="card-header py-2">СИГНАЛЫ (Live)</div>
+                <div class="card-body p-0" style="max-height: 800px; overflow-y: auto;">
+                    <ul class="list-group list-group-flush" id="signalsList"></ul>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-9">
+            <div class="card mb-3">
+                <div class="card-header py-2">АКТИВНЫЕ ПОЗИЦИИ (Live PNL)</div>
+                <div class="card-body p-0">
+                    <table class="table table-dark mb-0 table-hover">
+                        <thead><tr><th>Монета</th><th>Ср. цена</th><th>Шаг DCA</th><th>Объем</th><th>Комиссии (Откр+Фанд)</th><th>Gross PNL</th><th>Net PNL</th><th>Действие</th></tr></thead>
+                        <tbody id="positionsTable"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card mb-4">
+                <div class="card-header py-2">ЖУРНАЛ ЗАКРЫТЫХ СДЕЛОК</div>
+                <div class="card-body p-0">
+                    <table class="table table-dark mb-0 table-hover">
+                        <thead><tr><th>Время</th><th>Монета</th><th>Вход</th><th>Выход</th><th>Объем</th><th>Gross PNL</th><th>Комиссии (Откр/Фанд/Закр)</th><th>Net PNL</th></tr></thead>
+                        <tbody id="historyTable"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+let pnlChart = null;
+
+function formatTime(isoString, timeOnly=false) {
+    if (!isoString || isoString === "--:--") return "--:--";
+    let safeString = isoString.replace(" ", "T"); 
+    if (!safeString.includes("Z") && !safeString.includes("+")) safeString += "Z";
+    let d = new Date(safeString);
+    if (isNaN(d)) return isoString;
+    let moscowTime = new Date(d.getTime() + (3 * 60 * 60 * 1000));
+    let dd = String(moscowTime.getUTCDate()).padStart(2, '0');
+    let mm = String(moscowTime.getUTCMonth() + 1).padStart(2, '0');
+    let yy = String(moscowTime.getUTCFullYear()).slice(-2);
+    let hh = String(moscowTime.getUTCHours()).padStart(2, '0');
+    let min = String(moscowTime.getUTCMinutes()).padStart(2, '0');
+    if (timeOnly) return `${hh}:${min}`;
+    return `${dd}.${mm}.${yy} ${hh}:${min}`;
+}
+
+function formatPrice(p) { return p ? Number(p.toFixed(6)).toString() : '-'; }
+
+function closePosition(coin) {
+    if (confirm(`Вы уверены, что хотите закрыть позицию по ${coin} по рынку? Все связанные ордера будут отменены.`)) {
+        fetch(`/api/positions/${coin}/close`, { method: 'POST' })
+        .then(r => r.json())
+        .then(res => {
+            if (res.status !== 'ok') {
+                alert(`Ошибка при закрытии ${coin}: ${res.message || 'Неизвестная ошибка'}`);
+            }
+            updateData(); // Обновить данные, чтобы убрать позицию из списка
+        });
+    }
+}
+
+function updateData() {
+    fetch('/api/data').then(r=>r.json()).then(data => {
+        document.getElementById('equityDisplay').innerText = '$' + data.equity.toFixed(2);
+
+        let sigHTML = '';
+        data.recent_signals.forEach(s => {
+            let color = s.type === 'CLOSE' ? 'text-danger' : (s.type === 'OPEN' ? 'text-success' : 'text-warning');
+            sigHTML += `<li class="list-group-item bg-transparent text-light border-secondary"><div class="d-flex justify-content-between">
+                <strong class="${color}">${s.type}</strong><small style="color:#b0b0b0;">${formatTime(s.time)}</small></div>
+                <div class="mt-1">${s.coin} @ ${formatPrice(s.price)}</div></li>`;
+        });
+        document.getElementById('signalsList').innerHTML = sigHTML;
+
+        let posHTML = '';
+        for (let coin in data.positions) {
+            let p = data.positions[coin];
+            let badge = p.step === 0 ? 'badge-open' : 'badge-dca';
+            let gClass = p.gross_pnl >= 0 ? 'text-success' : 'text-danger';
+            let nClass = p.net_pnl >= 0 ? 'text-success' : 'text-danger';
+            
+            posHTML += `<tr><td><strong>${coin}</strong></td><td>${formatPrice(p.avg_price)}</td>
+                <td><span class="badge ${badge}">Шаг ${p.step}</span></td><td>$${p.invested.toFixed(2)}</td>
+                <td class="fees-text">-$${(p.open_fee + p.funding).toFixed(3)} <br><small>(O: ${p.open_fee.toFixed(3)} | F: ${p.funding.toFixed(3)})</small></td>
+                <td class="${gClass}">$${p.gross_pnl.toFixed(2)}</td>
+                <td class="${nClass}"><strong>$${p.net_pnl.toFixed(2)}</strong></td>
+                <td class="text-center"><button class="btn btn-sm btn-outline-danger" onclick="closePosition('${coin}')">Закрыть</button></td></tr>`;
+        }
+        document.getElementById('positionsTable').innerHTML = posHTML || '<tr><td colspan="8" class="text-center text-muted">Нет открытых сделок</td></tr>';
+    });
+}
+
+function updateHistory() {
+    fetch('/api/history').then(r=>r.json()).then(data => {
+        let histHTML = '';
+        data.history.forEach(t => {
+            let nClass = t.net_pnl >= 0 ? 'text-success' : 'text-danger';
+            let gClass = t.gross_pnl >= 0 ? 'text-light' : 'text-danger';
+            
+            histHTML += `<tr>
+                <td><span style="color: #b0b0b0;">${formatTime(t.time)}</span></td>
+                <td><strong>${t.symbol}</strong></td>
+                <td>${formatPrice(t.avg)}</td><td>${formatPrice(t.exit)}</td>
+                <td>$${t.total_inv.toFixed(1)}</td>
+                <td class="${gClass}">$${t.gross_pnl.toFixed(2)}<br><small>${t.pnl_p}%</small></td>
+                <td class="fees-text">-$${(t.open_fee+t.fund_fee+t.close_fee).toFixed(3)}<br><small>(${t.open_fee.toFixed(3)} / ${t.fund_fee.toFixed(3)} / ${t.close_fee.toFixed(3)})</small></td>
+                <td class="${nClass}"><strong>${t.net_pnl>=0?'+':''}$${t.net_pnl.toFixed(2)}</strong></td>
+            </tr>`;
+        });
+        document.getElementById('historyTable').innerHTML = histHTML;
+        
+        let ctx = document.getElementById('pnlChart').getContext('2d');
+        if(pnlChart) pnlChart.destroy();
+        pnlChart = new Chart(ctx, {
+            type: 'line', data: { labels: data.chart.map(d => formatTime(d.time, true)), 
+            datasets: [{ label: 'Net PNL $', data: data.chart.map(d=>d.total), borderColor: '#00e676', backgroundColor: 'rgba(0,230,118,0.1)', fill: true, tension: 0.3, pointRadius: 2 }] },
+            options: { animation: false, maintainAspectRatio: false, scales: { x: { grid: { color: '#333' }, ticks: { color: '#bbb', maxTicksLimit: 15 } }, y: { grid: { color: '#333' }, ticks: { color: '#bbb' } } }, plugins: { legend: { display: false } } }
+        });
+    });
+}
+
+setInterval(updateData, 2000); setInterval(updateHistory, 5000);
+updateData(); updateHistory();
+</script>
+</body></html>

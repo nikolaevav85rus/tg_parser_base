@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ru" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8"><title>Trading Bot Terminal - Настройки</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;}
+        .card { background-color: #1e1e1e; border: 1px solid #333; }
+        .table-dark { background-color: #1e1e1e; }
+        .table-dark th, .table-dark td { border-color: #333; color: #e0e0e0; }
+        .nav-link { color: #9e9e9e !important; }
+        .nav-link.active { color: #ffffff !important; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg navbar-dark" style="background-color: #1a1a1a; border-bottom: 1px solid #333;">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="/">🤖 AlgoBot Dashboard</a>
+        <div class="collapse navbar-collapse">
+            <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                <li class="nav-item"><a class="nav-link" href="/">Мониторинг</a></li>
+                <li class="nav-item"><a class="nav-link active" href="/settings">Настройки</a></li>
+            </ul>
+        </div>
+    </div>
+</nav>
+
+<div class="container mt-4">
+    <div class="row">
+        <div class="col-md-5">
+            <div class="card mb-4">
+                <div class="card-body">
+                    <h6 class="text-light mb-3 border-bottom border-secondary pb-2">Торговые параметры</h6>
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="allowOpen">
+                        <label class="form-check-label text-light">Разрешить новые входы (OPEN)</label>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="allowDCA">
+                        <label class="form-check-label text-light">Разрешить усреднения (DCA)</label>
+                    </div>
+
+                    <div class="mb-3 mt-4">
+                        <label class="form-label text-light small mb-1">Депозит для расчетов (USDT)</label>
+                        <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="tradeLimit">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-light small mb-1">Кредитное плечо</label>
+                        <input type="number" class="form-control bg-dark text-light border-secondary" id="leverage">
+                    </div>
+                    <div class="mb-4">
+                        <label class="form-label text-light small mb-1">Целевой TP (%)</label>
+                        <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="tpTarget">
+                    </div>
+
+                    <h6 class="text-info mb-3 small border-bottom border-secondary pb-2">Объемы ордеров (% от депозита)</h6>
+                    <div class="row mb-3">
+                        <div class="col-6">
+                            <label class="text-light small mb-1">Вход (Шаг 0)</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dca0">
+                        </div>
+                        <div class="col-6">
+                            <label class="text-light small mb-1">DCA 1</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dca1">
+                        </div>
+                    </div>
+                    <div class="row mb-4">
+                        <div class="col-6">
+                            <label class="text-light small mb-1">DCA 2</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dca2">
+                        </div>
+                        <div class="col-6">
+                            <label class="text-light small mb-1">DCA 3</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dca3">
+                        </div>
+                    </div>
+
+                    <h6 class="text-info mb-3 mt-4 small border-bottom border-secondary pb-2">Уровни отклонения для DCA (%)</h6>
+                    <div class="row mb-4">
+                        <div class="col-4">
+                            <label class="text-light small mb-1">DCA 1 (%)</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dcaLevel1">
+                        </div>
+                        <div class="col-4">
+                            <label class="text-light small mb-1">DCA 2 (%)</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dcaLevel2">
+                        </div>
+                        <div class="col-4">
+                            <label class="text-light small mb-1">DCA 3 (%)</label>
+                            <input type="number" step="0.1" class="form-control bg-dark text-light border-secondary" id="dcaLevel3">
+                        </div>
+                    </div>
+
+                    <button class="btn btn-success w-100 mt-2" onclick="saveSettings()" id="saveBtn">Сохранить параметры</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-md-7">
+            <div class="card">
+                <div class="card-header text-light py-2 border-secondary" style="background-color: #252525;">База торгуемых монет (Whitelist)</div>
+                <div class="card-body p-0">
+                    <table class="table table-dark mb-0 table-hover">
+                        <thead>
+                            <tr>
+                                <th class="text-light">Монета</th>
+                                <th class="text-light">Алиас (Bybit)</th>
+                                <th class="text-light">Торговля</th>
+                                <th></th>
+                            </tr>
+                            <tr style="border-bottom: 2px solid #333;">
+                                <td><input type="text" id="newCoin" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="BTCUSDT"></td>
+                                <td><input type="text" id="newAlias" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="Опционально"></td>
+                                <td colspan="2"><button class="btn btn-sm btn-outline-success w-100" onclick="addCoin()">Добавить</button></td>
+                            </tr>
+                        </thead>
+                        <tbody id="coinsTable"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function loadSettings() {
+    fetch('/api/settings').then(r => r.json()).then(data => {
+        if(Object.keys(data).length === 0) return;
+        document.getElementById('allowOpen').checked = data.allow_open;
+        document.getElementById('allowDCA').checked = data.allow_dca;
+        document.getElementById('tradeLimit').value = data.trade_limit;
+        document.getElementById('leverage').value = data.leverage;
+        document.getElementById('tpTarget').value = data.tp_target;
+        
+        // Объемы
+        document.getElementById('dca0').value = data.dca_0;
+        document.getElementById('dca1').value = data.dca_1;
+        document.getElementById('dca2').value = data.dca_2;
+        document.getElementById('dca3').value = data.dca_3;
+        
+        // Уровни (маппинг ключей из JSON) 
+        document.getElementById('dcaLevel1').value = data.dca_level_1;
+        document.getElementById('dcaLevel2').value = data.dca_level_2;
+        document.getElementById('dcaLevel3').value = data.dca_level_3;
+    });
+}
+
+function saveSettings() {
+    const payload = {
+        allow_open: document.getElementById('allowOpen').checked,
+        allow_dca: document.getElementById('allowDCA').checked,
+        trade_limit: parseFloat(document.getElementById('tradeLimit').value),
+        leverage: parseInt(document.getElementById('leverage').value),
+        tp_target: parseFloat(document.getElementById('tpTarget').value),
+        
+        dca_0: parseFloat(document.getElementById('dca0').value),
+        dca_1: parseFloat(document.getElementById('dca1').value),
+        dca_2: parseFloat(document.getElementById('dca2').value),
+        dca_3: parseFloat(document.getElementById('dca3').value),
+        
+        dca_level_1: parseFloat(document.getElementById('dcaLevel1').value),
+        dca_level_2: parseFloat(document.getElementById('dcaLevel2').value),
+        dca_level_3: parseFloat(document.getElementById('dcaLevel3').value)
+    };
+    
+    let btn = document.getElementById('saveBtn');
+    fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    }).then(r => r.json()).then(res => {
+        btn.innerText = "Сохранено!";
+        setTimeout(() => { btn.innerText = "Сохранить параметры"; }, 2000);
+        loadSettings();
+    });
+}
+
+function loadCoins() {
+    fetch('/api/coins').then(r => r.json()).then(data => {
+        let html = '';
+        data.forEach(c => {
+            let checked = c.is_active ? 'checked' : '';
+            html += `<tr>
+                <td class="align-middle fw-bold text-light">${c.coin}</td>
+                <td class="align-middle text-muted">${c.alias || '-'}</td>
+                <td class="align-middle">
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" ${checked} onchange="toggleCoin('${c.coin}', this.checked)">
+                    </div>
+                </td>
+                <td class="align-middle text-end">
+                    <button class="btn btn-sm btn-outline-danger" onclick="deleteCoin('${c.coin}')">Удалить</button>
+                </td>
+            </tr>`;
+        });
+        document.getElementById('coinsTable').innerHTML = html || '<tr><td colspan="4" class="text-center text-muted">Список пуст</td></tr>';
+    });
+}
+
+function addCoin() {
+    let coin = document.getElementById('newCoin').value.trim().toUpperCase();
+    let alias = document.getElementById('newAlias').value.trim().toUpperCase();
+    if(!coin) return;
+    fetch('/api/coins', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({coin: coin, alias: alias})
+    }).then(() => {
+        document.getElementById('newCoin').value = '';
+        document.getElementById('newAlias').value = '';
+        loadCoins();
+    });
+}
+
+function toggleCoin(coin, isActive) {
+    fetch(`/api/coins/${coin}`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({is_active: isActive})
+    });
+}
+
+function deleteCoin(coin) {
+    if(confirm(`Удалить монету ${coin}?`)) {
+        fetch(`/api/coins/${coin}`, { method: 'DELETE' }).then(() => loadCoins());
+    }
+}
+
+window.onload = () => { loadSettings(); loadCoins(); };
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+telethon
+pybit
+fastapi
+uvicorn
+jinja2
+python-dotenv
+aiohttp
