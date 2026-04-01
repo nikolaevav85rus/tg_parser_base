@@ -21,13 +21,11 @@ class TradingBot:
     Основной класс приложения, инкапсулирующий состояние и жизненный цикл бота.
     """
     def __init__(self) -> None:
-        # Инициализация баз данных
+        # Инициализация экземпляров баз данных (без подключения, так как оно теперь асинхронное)
         self.db = Database()
         self.trades_db = TradesDatabase()
         self.settings_db = SettingsDatabase()
         self.coins_db = CoinsDatabase()
-        
-        self.settings_db.ensure_defaults()
 
         # Инициализация сервисов
         self.notifier = Notifier(self.trades_db, self.settings_db)
@@ -47,7 +45,7 @@ class TradingBot:
         self.client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
         self.notifier.set_tg_client(self.client)
         
-        # Очередь для асинхронной обработки сигналов без блокировки хендлера
+        # Очередь для асинхронной обработки сигналов без блокировки хендлера Telegram
         self.signal_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
 
     async def _telegram_handler(self, event: events.NewMessage.Event) -> None:
@@ -83,9 +81,8 @@ class TradingBot:
         while True:
             signal = await self.signal_queue.get()
             try:
-                # ВАЖНО: Если db.save_signal синхронный, его нужно обернуть в asyncio.to_thread
-                # is_saved = await asyncio.to_thread(self.db.save_signal, signal)
-                is_saved = self.db.save_signal(signal) # Предполагаем, что ты сделаешь его async
+                # Нативное асинхронное сохранение в БД (aiosqlite)
+                is_saved = await self.db.save_signal(signal)
                 
                 if is_saved:
                     bot_logger.info(f"🚀 Выполнение сигнала для {signal.get('coin')}")
@@ -104,7 +101,14 @@ class TradingBot:
         """
         Запуск всех подсистем бота.
         """
-        # Если load_active_positions синхронная - оборачиваем, чтобы не блочить старт
+        bot_logger.info("Инициализация баз данных...")
+        # Инициализируем таблицы и дефолтные значения асинхронно
+        await self.db.init_db()
+        await self.trades_db.init_db()
+        await self.settings_db.init_db()
+        await self.coins_db.init_db()
+
+        # Оборачиваем вызов загрузки позиций в поток (пока мы не сделали bybit_exchange асинхронным)
         await asyncio.to_thread(self.exchange.load_active_positions)
         
         # Регистрируем хендлер
@@ -125,7 +129,7 @@ class TradingBot:
                 self.client.start(), 
                 self.exchange.monitor_fills(),
                 self.notifier.start_polling(),
-                self._signal_worker() # Добавлен фоновый воркер очереди
+                self._signal_worker() # Запуск фонового воркера очереди
             )
         except asyncio.CancelledError:
             bot_logger.info("Задачи были отменены (остановка работы).")
