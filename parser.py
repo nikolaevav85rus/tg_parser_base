@@ -1,4 +1,4 @@
-import re
+import re, os
 from logger import bot_logger
 from datetime import datetime, timezone
 
@@ -22,9 +22,8 @@ def parse_signal(text):
     if not header_match: return None
     header_action = header_match.group(1)
     
-    # Пропускаем все, что не является сигналом на открытие
     if not any(x in header_action for x in ['ОКУПК', 'OPEN', 'LONG']):
-        bot_logger.info(f"Парсер: Игнорируется сигнал '{header_action}' для {coin}, так как бот работает в автономном режиме и принимает только команды на открытие.")
+        bot_logger.info(f"Парсер: Игнорируется сигнал '{header_action}' для {coin}")
         return None
 
     signal_type = 'OPEN'
@@ -35,6 +34,13 @@ def parse_signal(text):
 
     t_m = re.search(r'родать[^\d]*([0-9.]+)', clean_text, re.I)
     target_p = float(t_m.group(1)) if t_m else None
+
+    # ИСПРАВЛЕНИЕ: Запись в сырой текстовый лог ДО вызова торгового модуля
+    try:
+        with open("signals_raw.txt", "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {coin} | {signal_type} | Price: {price} | Text: {text[:50]}...\n")
+    except Exception as e:
+        bot_logger.error(f"Парсер: Не удалось записать в signals_raw.txt: {e}")
 
     bot_logger.info(f"Парсер: Разобран сигнал {coin} | {signal_type} | Цена: {price}")
     

@@ -17,13 +17,14 @@ class BybitExchange:
         self.active_positions = {}
         self.instrument_info_cache = {}
         self.price_step_cache = {}
+        self.leverage_cache = {} # Кэш для предотвращения лишних запросов к API
         self.live_stats = {} 
         bot_logger.info("Биржевой модуль BybitExchange инициализирован.")
 
     def _get_dca_grid(self):
         """Загрузка динамических настроек сетки из БД."""
         return {
-            "tp_target": float(self.settings.get("tp_target", "0.7")), # Установлено 0.7% по твоему запросу
+            "tp_target": float(self.settings.get("tp_target", "0.7")),
             "volumes": [
                 float(self.settings.get("dca_0", "2.0")),
                 float(self.settings.get("dca_1", "4.0")),
@@ -36,6 +37,42 @@ class BybitExchange:
                 float(self.settings.get("dca_level_3", "14.5"))
             ]
         }
+
+    async def _ensure_leverage(self, symbol, target_leverage):
+        """
+        Проверяет текущее плечо и устанавливает его только при необходимости.
+        Исключает ошибку 110043 (leverage not modified).
+        """
+        if self.leverage_cache.get(symbol) == target_leverage:
+            return True
+
+        try:
+            # Проверяем реальное состояние на бирже
+            res = await asyncio.to_thread(self.session.get_positions, category="linear", symbol=symbol)
+            if res['retCode'] == 0 and res['result']['list']:
+                current_lev = int(res['result']['list'][0]['leverage'])
+                if current_lev == target_leverage:
+                    self.leverage_cache[symbol] = target_leverage
+                    return True
+
+            # Устанавливаем только если отличается
+            await asyncio.to_thread(
+                self.session.set_leverage,
+                category="linear", symbol=symbol,
+                buyLeverage=str(target_leverage),
+                sellLeverage=str(target_leverage)
+            )
+            self.leverage_cache[symbol] = target_leverage
+            bot_logger.info(f"Плечо {target_leverage}x установлено для {symbol}")
+            return True
+        except Exception as e:
+            if "110043" in str(e):
+                self.leverage_cache[symbol] = target_leverage
+                return True
+            bot_logger.warning(f"Не удалось проверить/установить плечо для {symbol}: {e}")
+            # Возвращаем True, так как ошибка установки плеча не должна блокировать вход, 
+            # если оно уже могло быть установлено ранее вручную.
+            return True
 
     def check_connection(self):
         try: 
@@ -140,7 +177,7 @@ class BybitExchange:
         return None, None, 0.0
 
     async def execute_signal(self, coin, signal_type, signal_price, target_price):
-        """Вход в сделку и инициализация Recursive DCA сетки."""
+        """Вход в сделку."""
         bot_logger.info(f"⚡ ТОРГОВЫЙ МОДУЛЬ: Получена команда {signal_type} для {coin}")
         
         coin_info = self.coins_db.get_coin(coin)
@@ -156,8 +193,10 @@ class BybitExchange:
             leverage = int(self.settings.get("leverage", config.LEVERAGE))
             deposit = float(self.settings.get("trade_limit", self.trade_limit))
             
+            # Установка плеча только при необходимости (идемпотентно)
+            await self._ensure_leverage(coin, leverage)
+            
             try:
-                await asyncio.to_thread(self.session.set_leverage, category="linear", symbol=coin, buyLeverage=str(leverage), sellLeverage=str(leverage))
                 tick = await asyncio.to_thread(self.session.get_tickers, category="linear", symbol=coin)
                 price = float(tick['result']['list'][0]['lastPrice'])
                 
@@ -174,7 +213,7 @@ class BybitExchange:
                     real_p, real_inv = real_p or price, real_inv or (qty * price)
                     
                     self.db.create_trade(coin, real_p, real_inv, 0.0, leverage, exec_fee)
-                    bot_logger.info(f"Исполнен вход {coin}. Цена: {real_p}. Сетка: DCA_1 {grid['levels'][0]}%, TP {grid['tp_target']}%")
+                    bot_logger.info(f"Исполнен вход {coin}. Цена: {real_p}.")
 
                     # 1. Лимитный Тейк-Профит
                     tp_price = self._round_price(real_p * (1 + grid["tp_target"] / 100.0), price_step)
@@ -182,7 +221,7 @@ class BybitExchange:
                     if tp_order.get("retCode") == 0:
                         self.db.set_tp_order_id(coin, tp_order["result"]["orderId"])
 
-                    # 2. Лимитный DCA_1 (Recursive: от цены входа real_p)
+                    # 2. Лимитный DCA_1 (от цены входа)
                     dca1_price = self._round_price(real_p * (1 - grid["levels"][0] / 100.0), price_step)
                     dca1_qty = self._calc_qty(deposit, grid["volumes"][1], leverage, dca1_price, qty_step)
                     dca_order = await self._place_limit(coin, "Buy", dca1_qty, dca1_price)
@@ -195,7 +234,7 @@ class BybitExchange:
                 bot_logger.critical(f"Ошибка OPEN {coin}: {e}")
 
     async def monitor_fills(self):
-        """Мониторинг исполнения Recursive DCA сетки."""
+        """Мониторинг исполнения сетки (DCA и TP). Плечо здесь НЕ меняется."""
         while True:
             await asyncio.sleep(2.0)
             try:
@@ -215,14 +254,13 @@ class BybitExchange:
                             self.load_active_positions()
                             continue
 
-                    # 2. Проверка DCA (Recursive Logic)
+                    # 2. Проверка DCA (Recursive)
                     if trade["dca_order_id"] and trade["dca_order_id"] not in open_order_ids:
                         filled_p, filled_inv, fee = await self._get_real_execution_data(trade["dca_order_id"], coin)
                         if not filled_p: continue
                         
                         next_step = int(trade["step"]) + 1
                         self.db.update_trade_dca(coin, next_step, filled_p, filled_inv, fee)
-                        bot_logger.info(f"⚖️ Исполнено усреднение №{next_step} для {coin}. Цена: {filled_p}")
                         
                         updated = self.db.get_trading_trade(coin)
                         await self._cancel_order_safe(coin, trade["tp_order_id"])
@@ -241,19 +279,16 @@ class BybitExchange:
                         if tp_res.get("retCode") == 0:
                             self.db.set_tp_order_id(coin, tp_res["result"]["orderId"])
                         
-                        # Новый DCA от цены последнего исполнения (filled_p)
+                        # Новый DCA от цены последнего исполнения
                         if next_step < 3:
                             next_dev = grid["levels"][next_step]
                             next_vol = grid["volumes"][next_step + 1]
-                            
-                            # RECURSIVE CALC: Цена следующего шага от цены текущего исполнения
                             next_p = self._round_price(filled_p * (1 - next_dev / 100.0), price_step)
                             next_q = self._calc_qty(deposit, next_vol, leverage, next_p, qty_step)
                             
                             dca_res = await self._place_limit(coin, "Buy", next_q, next_p)
                             if dca_res.get("retCode") == 0:
                                 self.db.set_dca_order_id(coin, dca_res["result"]["orderId"])
-                                bot_logger.info(f"Выставлен Recursive DCA_{next_step+1} по цене {next_p}")
                         
                         await self.notifier.send(f"⚖️ <b>DCA #{next_step}: {coin}</b>\nСр.цена: {updated['avg_p']:.4f}\nНовый TP: {new_tp}")
                         self.load_active_positions()
