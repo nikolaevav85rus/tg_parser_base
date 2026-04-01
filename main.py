@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import aiofiles
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
@@ -56,16 +57,28 @@ class TradingBot:
         if not event.message.message:
             return
         
-        time_now = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M:%S')
-        bot_logger.info(f"🔔 [{time_now}] Получено сообщение TG (ID: {event.message.id})")
-
+        raw_text = event.message.message
+        utc_now = datetime.now(timezone.utc)
+        time_local = (utc_now + timedelta(hours=3)).strftime('%H:%M:%S')
+        
+        # 1. АСИНХРОННО ЛОГИРУЕМ СЫРОЙ СИГНАЛ (до парсинга)
         try:
-            parsed_data: Optional[Dict[str, Any]] = parse_signal(event.message.message)
+            async with aiofiles.open("signals_raw.txt", "a", encoding="utf-8") as f:
+                await f.write(f"[{utc_now.isoformat()}] ID: {event.message.id}\nRAW TEXT:\n{raw_text}\n{'='*40}\n")
+        except Exception as e:
+            bot_logger.error(f"Не удалось записать сырой сигнал в signals_raw.txt: {e}")
+
+        bot_logger.info(f"🔔 [{time_local}] Получено сообщение TG (ID: {event.message.id})")
+
+        # 2. ПАРСИНГ И ОТПРАВКА В ОЧЕРЕДЬ
+        try:
+            parsed_data: Optional[Dict[str, Any]] = parse_signal(raw_text)
             if not parsed_data:
+                bot_logger.warning(f"Парсер вернул None для сообщения ID: {event.message.id}. Смотри signals_raw.txt")
                 return
             
-            parsed_data['received_at'] = datetime.now(timezone.utc).isoformat()
-            parsed_data['raw_text'] = event.message.message
+            parsed_data['received_at'] = utc_now.isoformat()
+            parsed_data['raw_text'] = raw_text
             
             # Кладем в очередь и моментально освобождаем хендлер
             await self.signal_queue.put(parsed_data)
@@ -108,7 +121,7 @@ class TradingBot:
         await self.settings_db.init_db()
         await self.coins_db.init_db()
 
-        # Оборачиваем вызов загрузки позиций в поток (пока мы не сделали bybit_exchange асинхронным)
+        # Инициализируем настройки биржи и кэш активных позиций
         await self.exchange._init_settings()
         await self.exchange.load_active_positions()
         
