@@ -1,78 +1,153 @@
-import asyncio, uvicorn, sys, os
+import asyncio
+import sys
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
+
+import uvicorn
 from telethon import TelegramClient, events
+
+# Локальные импорты
 import config
 from parser import parse_signal
 from database import Database, TradesDatabase, SettingsDatabase, CoinsDatabase
 from bybit_exchange import BybitExchange 
 from web_server import app, set_context
 from notifier import Notifier
-from datetime import datetime, timezone, timedelta
 from logger import bot_logger
 
-trade_lock = asyncio.Lock()
 
-db = Database()
-trades_db = TradesDatabase()
-settings_db = SettingsDatabase()
-coins_db = CoinsDatabase()
-settings_db.ensure_defaults()
+class TradingBot:
+    """
+    Основной класс приложения, инкапсулирующий состояние и жизненный цикл бота.
+    """
+    def __init__(self) -> None:
+        # Инициализация баз данных
+        self.db = Database()
+        self.trades_db = TradesDatabase()
+        self.settings_db = SettingsDatabase()
+        self.coins_db = CoinsDatabase()
+        
+        self.settings_db.ensure_defaults()
 
-bot_notifier = Notifier(trades_db, settings_db)
-exchange = BybitExchange(config.DEPO_USDT, trades_db, settings_db, coins_db, bot_notifier)
-bot_notifier.set_exchange(exchange)
-set_context(db, exchange, trades_db, settings_db, coins_db)
-
-client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
-bot_notifier.set_tg_client(client)
-
-@client.on(events.NewMessage(chats=config.TARGET_CHANNEL))
-async def handler(event):
-    if not event.message.message: return
-    
-    # 1. ЛОГИРУЕМ СРАЗУ (вне блокировки)
-    time_now = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M:%S')
-    bot_logger.info(f"🔔 [{time_now}] Получено сообщение TG (ID: {event.message.id})")
-
-    # 2. ОЧЕРЕДЬ НА ОБРАБОТКУ
-    async with trade_lock:
-        try:
-            p = parse_signal(event.message.message)
-            if not p: return
-            p['received_at'] = datetime.now(timezone.utc).isoformat()
-            p['raw_text'] = event.message.message
-            if db.save_signal(p):
-                await exchange.execute_signal(p['coin'], p['signal_type'], p['price'], p['target_price'])
-        except Exception as e: bot_logger.error(f"Ошибка в handler: {e}")
-
-async def main():
-    exchange.load_active_positions()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning"))
-    
-    bot_logger.info("🚀 Запуск всех систем бота...")
-    try:
-        # Запускаем задачи
-        await asyncio.gather(
-            server.serve(), 
-            client.start(), 
-            exchange.monitor_fills(),
-            bot_notifier.start_polling()
+        # Инициализация сервисов
+        self.notifier = Notifier(self.trades_db, self.settings_db)
+        self.exchange = BybitExchange(
+            config.DEPO_USDT, 
+            self.trades_db, 
+            self.settings_db, 
+            self.coins_db, 
+            self.notifier
         )
-    except asyncio.CancelledError:
-        # Это нормально при остановке gather
-        pass
-    except Exception as e:
-        bot_logger.error(f"Критическая ошибка в main loop: {e}")
-    finally:
-        bot_logger.info("📴 Системы останавливаются...")
-        await client.disconnect()
-        bot_logger.info("🛑 РАБОТА ЗАВЕРШЕНА: Бот полностью остановлен.")
+        self.notifier.set_exchange(self.exchange)
+        
+        # Настройка веб-контекста
+        set_context(self.db, self.exchange, self.trades_db, self.settings_db, self.coins_db)
 
-if __name__ == '__main__':
+        # Telegram клиент
+        self.client = TelegramClient(config.SESSION_NAME, config.API_ID, config.API_HASH)
+        self.notifier.set_tg_client(self.client)
+        
+        # Очередь для асинхронной обработки сигналов без блокировки хендлера
+        self.signal_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+    async def _telegram_handler(self, event: events.NewMessage.Event) -> None:
+        """
+        Обработчик новых сообщений из Telegram. 
+        Работает как Producer: быстро принимает сообщение и кладет в очередь.
+        """
+        if not event.message.message:
+            return
+        
+        time_now = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime('%H:%M:%S')
+        bot_logger.info(f"🔔 [{time_now}] Получено сообщение TG (ID: {event.message.id})")
+
+        try:
+            parsed_data: Optional[Dict[str, Any]] = parse_signal(event.message.message)
+            if not parsed_data:
+                return
+            
+            parsed_data['received_at'] = datetime.now(timezone.utc).isoformat()
+            parsed_data['raw_text'] = event.message.message
+            
+            # Кладем в очередь и моментально освобождаем хендлер
+            await self.signal_queue.put(parsed_data)
+            
+        except Exception as e:
+            bot_logger.error(f"Ошибка при парсинге сообщения в _telegram_handler: {e}")
+
+    async def _signal_worker(self) -> None:
+        """
+        Фоновый воркер (Consumer), который разгребает очередь сигналов.
+        Выполняет обращения к БД и бирже по очереди.
+        """
+        while True:
+            signal = await self.signal_queue.get()
+            try:
+                # ВАЖНО: Если db.save_signal синхронный, его нужно обернуть в asyncio.to_thread
+                # is_saved = await asyncio.to_thread(self.db.save_signal, signal)
+                is_saved = self.db.save_signal(signal) # Предполагаем, что ты сделаешь его async
+                
+                if is_saved:
+                    bot_logger.info(f"🚀 Выполнение сигнала для {signal.get('coin')}")
+                    await self.exchange.execute_signal(
+                        signal['coin'], 
+                        signal['signal_type'], 
+                        signal['price'], 
+                        signal['target_price']
+                    )
+            except Exception as e:
+                bot_logger.error(f"Ошибка при обработке сигнала воркером: {e}")
+            finally:
+                self.signal_queue.task_done()
+
+    async def run(self) -> None:
+        """
+        Запуск всех подсистем бота.
+        """
+        # Если load_active_positions синхронная - оборачиваем, чтобы не блочить старт
+        await asyncio.to_thread(self.exchange.load_active_positions)
+        
+        # Регистрируем хендлер
+        self.client.add_event_handler(
+            self._telegram_handler, 
+            events.NewMessage(chats=config.TARGET_CHANNEL)
+        )
+
+        uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+        server = uvicorn.Server(uvicorn_config)
+        
+        bot_logger.info("🚀 Запуск всех систем бота...")
+        
+        try:
+            # Запускаем все фоновые задачи параллельно
+            await asyncio.gather(
+                server.serve(), 
+                self.client.start(), 
+                self.exchange.monitor_fills(),
+                self.notifier.start_polling(),
+                self._signal_worker() # Добавлен фоновый воркер очереди
+            )
+        except asyncio.CancelledError:
+            bot_logger.info("Задачи были отменены (остановка работы).")
+        except Exception as e:
+            bot_logger.error(f"Критическая ошибка в main loop: {e}")
+        finally:
+            bot_logger.info("📴 Системы останавливаются...")
+            await self.client.disconnect()
+            bot_logger.info("🛑 РАБОТА ЗАВЕРШЕНА: Бот полностью остановлен.")
+
+
+def main_sync() -> None:
+    """Синхронная точка входа для настройки политик и запуска цикла."""
     if sys.platform == "win32": 
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
+    bot = TradingBot()
     try:
-        asyncio.run(main())
+        asyncio.run(bot.run())
     except KeyboardInterrupt:
-        # Ловим Ctrl+C здесь, чтобы не выводить Traceback в консоль
-        pass
+        print("\nЗавершение программы пользователем (Ctrl+C).")
+
+
+if __name__ == '__main__':
+    main_sync()
