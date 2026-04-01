@@ -109,7 +109,8 @@ class TradingBot:
         await self.coins_db.init_db()
 
         # Оборачиваем вызов загрузки позиций в поток (пока мы не сделали bybit_exchange асинхронным)
-        await asyncio.to_thread(self.exchange.load_active_positions)
+        await self.exchange._init_settings()
+        await self.exchange.load_active_positions()
         
         # Регистрируем хендлер
         self.client.add_event_handler(
