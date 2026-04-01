@@ -14,6 +14,10 @@
         .chart-container { position: relative; height: 180px; width: 100%; }
         .card-header { background-color: #252525; color: #ffffff !important; font-weight: bold; border-bottom: 1px solid #444; }
         .fees-text { color: #ffab00; font-size: 0.8rem; }
+        /* Стили для нового блока PNL */
+        .pnl-stats-box { background: #222; padding: 4px 15px; border-radius: 6px; border: 1px solid #333; font-size: 0.85rem;}
+        .pnl-stats-box span { margin-right: 15px; color: #aaa; }
+        .pnl-stats-box span:last-child { margin-right: 0; }
     </style>
 </head>
 <body>
@@ -21,7 +25,18 @@
     <div class="container-fluid">
         <a class="navbar-brand" href="/">🤖 AlgoBot Dashboard</a>
         <div class="d-flex align-items-center">
-            <span class="me-4" style="font-size: 1.1rem;">Баланс: <strong class="text-success" id="equityDisplay">$0.00</strong></span>
+            
+            <div class="d-none d-xl-flex pnl-stats-box me-4 align-items-center">
+                <span>1D: <strong id="pnl1d">$0.00</strong></span>
+                <span>7D: <strong id="pnl7d">$0.00</strong></span>
+                <span>30D: <strong id="pnl30d">$0.00</strong></span>
+                <span>1Y: <strong id="pnl365d">$0.00</strong></span>
+                <span>Total PNL: <strong id="pnltotal">$0.00</strong></span>
+            </div>
+
+            <span class="me-4" style="font-size: 1.1rem; border-left: 1px solid #444; padding-left: 15px;">
+                Баланс: <strong class="text-success" id="equityDisplay">$0.00</strong>
+            </span>
             <a href="/settings" class="btn btn-sm btn-outline-secondary">⚙️ Настройки</a>
         </div>
     </div>
@@ -99,7 +114,7 @@ function closePosition(coin) {
             if (res.status !== 'ok') {
                 alert(`Ошибка при закрытии ${coin}: ${res.message || 'Неизвестная ошибка'}`);
             }
-            updateData(); // Обновить данные, чтобы убрать позицию из списка
+            updateData(); 
         });
     }
 }
@@ -137,6 +152,20 @@ function updateData() {
 
 function updateHistory() {
     fetch('/api/history').then(r=>r.json()).then(data => {
+        
+        // НОВЫЙ БЛОК: Обновление статистики PNL
+        if (data.stats) {
+            const periods = ['1d', '7d', '30d', '365d', 'total'];
+            periods.forEach(p => {
+                let el = document.getElementById('pnl' + p);
+                if (el && data.stats[p] !== undefined) {
+                    let val = data.stats[p];
+                    el.innerText = (val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(2);
+                    el.className = val >= 0 ? 'text-success' : 'text-danger';
+                }
+            });
+        }
+
         let histHTML = '';
         data.history.forEach(t => {
             let nClass = t.net_pnl >= 0 ? 'text-success' : 'text-danger';

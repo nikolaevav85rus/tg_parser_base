@@ -1,6 +1,7 @@
 import asyncio
 import aiosqlite
 from typing import Any, Dict
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -51,7 +52,6 @@ async def get_settings() -> Dict[str, Any]:
         bot_logger.error("WEB: /api/settings - Контекст БД настроек НЕ установлен!")
         return {}
     try:
-        # Теперь все вызовы к settings_db_i должны быть с await
         return {
             "allow_open": await settings_db_i.get("allow_open", "False") == "True",
             "allow_dca": await settings_db_i.get("allow_dca", "False") == "True",
@@ -59,13 +59,11 @@ async def get_settings() -> Dict[str, Any]:
             "leverage": _safe_convert(int, await settings_db_i.get("leverage"), getattr(config, 'LEVERAGE', 10)),
             "tp_target": _safe_convert(float, await settings_db_i.get("tp_target"), 1.5),
             
-            # Объемы (% от депо)
             "dca_0": _safe_convert(float, await settings_db_i.get("dca_0"), 2.0),
             "dca_1": _safe_convert(float, await settings_db_i.get("dca_1"), 4.0),
             "dca_2": _safe_convert(float, await settings_db_i.get("dca_2"), 8.0),
             "dca_3": _safe_convert(float, await settings_db_i.get("dca_3"), 16.0),
             
-            # Уровни отклонения (%)
             "dca_level_1": _safe_convert(float, await settings_db_i.get("dca_level_1"), 3.5),
             "dca_level_2": _safe_convert(float, await settings_db_i.get("dca_level_2"), 6.5),
             "dca_level_3": _safe_convert(float, await settings_db_i.get("dca_level_3"), 14.5)
@@ -92,7 +90,6 @@ async def get_coins():
     if not coins_db_i: 
         return []
     try:
-        # Асинхронное подключение напрямую к файлу БД монет
         async with aiosqlite.connect(coins_db_i.db_name) as db:
             cursor = await db.execute("SELECT coin, alias, is_active FROM coins")
             rows = await cursor.fetchall()
@@ -135,12 +132,10 @@ async def get_data():
     if not all([exchange_i, trades_db_i, settings_db_i, db_i]): 
         return {}
     
-    # Ждем обновления живой статистики
     await exchange_i.fetch_live_stats()
     eq = await exchange_i.get_real_equity()
     limit = await settings_db_i.get("trade_limit", config.DEPO_USDT)
     
-    # Безопасное асинхронное получение последних сигналов
     sigs = []
     try:
         async with aiosqlite.connect(db_i.db_name) as db:
@@ -176,16 +171,36 @@ async def get_data():
 @app.get("/api/history")
 async def get_history():
     if not trades_db_i: 
-        return {"history": [], "chart": []}
+        return {"history": [], "chart": [], "stats": {}}
         
     raw = await trades_db_i.get_closed_trades()
-    hist, chart, total_net_pnl = [], [], 0
+    hist, chart = [], []
+    total_net_pnl = 0.0
+    
+    # Словарик для статистики PNL
+    stats = {"1d": 0.0, "7d": 0.0, "30d": 0.0, "365d": 0.0, "total": 0.0}
+    now = datetime.now(timezone.utc)
     
     for t in raw:
-        # Используем доступ по ключам словаря (aiosqlite.Row)
         gross = t['pnl'] or 0.0
         net = t['net_pnl'] if t['net_pnl'] is not None else gross
         total_net_pnl += net
+        stats["total"] += net
+        
+        # Парсим дату и раскидываем профит по корзинам времени
+        try:
+            created_str = t['created_at'].replace('Z', '+00:00')
+            dt = datetime.fromisoformat(created_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+                
+            delta = now - dt
+            if delta <= timedelta(days=1): stats["1d"] += net
+            if delta <= timedelta(days=7): stats["7d"] += net
+            if delta <= timedelta(days=30): stats["30d"] += net
+            if delta <= timedelta(days=365): stats["365d"] += net
+        except Exception:
+            pass # Игнорируем ошибки парсинга для сломанных старых записей
         
         hist.append({
             "time": t['created_at'], 
@@ -203,10 +218,13 @@ async def get_history():
         })
         chart.append({"time": t['created_at'], "total": round(total_net_pnl, 2)})
         
-    return {"history": hist[::-1], "chart": chart}
+    # Округляем статистику перед отправкой
+    for k in stats:
+        stats[k] = round(stats[k], 2)
+        
+    return {"history": hist[::-1], "chart": chart, "stats": stats}
 
 
-# === НОВЫЙ ЭНДПОИНТ ДЛЯ ЗАКРЫТИЯ СДЕЛОК ЧЕРЕЗ ВЕБ-ИНТЕРФЕЙС ===
 @app.post("/api/positions/{coin}/close")
 async def close_position_manual(coin: str):
     """Экстренное закрытие позиции по рынку по нажатию кнопки в UI."""
@@ -218,17 +236,14 @@ async def close_position_manual(coin: str):
         if not trade:
             return {"status": "error", "message": "Активная позиция не найдена в БД"}
 
-        # 1. Отменяем лимитные ордера (TP и DCA)
         await exchange_i._cancel_order_safe(coin, trade["tp_order_id"])
         await exchange_i._cancel_order_safe(coin, trade["dca_order_id"])
         
-        # 2. Получаем текущую цену для расчетов
         res = await exchange_i._api_call(exchange_i.session.get_tickers, category="linear", symbol=coin)
         if res.get('retCode') != 0:
             return {"status": "error", "message": "Не удалось получить текущую цену"}
         current_price = float(res['result']['list'][0]['lastPrice'])
         
-        # 3. Закрываем рыночным ордером (Market ReduceOnly)
         pos_res = await exchange_i._api_call(exchange_i.session.get_positions, category="linear", symbol=coin)
         if pos_res.get('retCode') == 0 and pos_res.get('result', {}).get('list'):
             size = float(pos_res['result']['list'][0]['size'])
