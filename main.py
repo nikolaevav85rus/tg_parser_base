@@ -1,6 +1,5 @@
 import asyncio
 import sys
-import aiofiles
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
@@ -14,7 +13,7 @@ from database import Database, TradesDatabase, SettingsDatabase, CoinsDatabase
 from bybit_exchange import BybitExchange 
 from web_server import app, set_context
 from notifier import Notifier
-from logger import bot_logger
+from logger import bot_logger, raw_logger  # <--- ИМПОРТИРОВАЛИ НОВЫЙ ЛОГГЕР
 
 
 class TradingBot:
@@ -22,7 +21,7 @@ class TradingBot:
     Основной класс приложения, инкапсулирующий состояние и жизненный цикл бота.
     """
     def __init__(self) -> None:
-        # Инициализация экземпляров баз данных (без подключения, так как оно теперь асинхронное)
+        # Инициализация экземпляров баз данных
         self.db = Database()
         self.trades_db = TradesDatabase()
         self.settings_db = SettingsDatabase()
@@ -61,12 +60,8 @@ class TradingBot:
         utc_now = datetime.now(timezone.utc)
         time_local = (utc_now + timedelta(hours=3)).strftime('%H:%M:%S')
         
-        # 1. АСИНХРОННО ЛОГИРУЕМ СЫРОЙ СИГНАЛ (до парсинга)
-        try:
-            async with aiofiles.open("signals_raw.txt", "a", encoding="utf-8") as f:
-                await f.write(f"[{utc_now.isoformat()}] ID: {event.message.id}\nRAW TEXT:\n{raw_text}\n{'='*40}\n")
-        except Exception as e:
-            bot_logger.error(f"Не удалось записать сырой сигнал в signals_raw.txt: {e}")
+        # 1. ЗАПИСЬ СЫРОГО СИГНАЛА ЧЕРЕЗ ЛОГГЕР (Безопасно и потоконезависимо)
+        raw_logger.info(f"ID: {event.message.id}\nRAW TEXT:\n{raw_text}\n{'='*40}")
 
         bot_logger.info(f"🔔 [{time_local}] Получено сообщение TG (ID: {event.message.id})")
 
@@ -74,7 +69,7 @@ class TradingBot:
         try:
             parsed_data: Optional[Dict[str, Any]] = parse_signal(raw_text)
             if not parsed_data:
-                bot_logger.warning(f"Парсер вернул None для сообщения ID: {event.message.id}. Смотри signals_raw.txt")
+                bot_logger.warning(f"Парсер вернул None для сообщения ID: {event.message.id}. Смотри signals_raw.log")
                 return
             
             parsed_data['received_at'] = utc_now.isoformat()

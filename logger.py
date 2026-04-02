@@ -37,9 +37,7 @@ def setup_logger() -> logging.Logger:
         datefmt='%d.%m.%Y %H:%M:%S'
     )
 
-    # Файловый обработчик с РОТАЦИЕЙ
-    # maxBytes=5242880 (5 МБ) - при достижении этого размера создается новый файл
-    # backupCount=5 - храним максимум 5 старых файлов (bot_system.log.1, bot_system.log.2 и т.д.)
+    # Файловый обработчик с РОТАЦИЕЙ для основных логов
     log_path = os.path.join(LOG_DIR, "bot_system.log")
     file_handler = RotatingFileHandler(
         log_path, 
@@ -61,5 +59,36 @@ def setup_logger() -> logging.Logger:
 
     return logger
 
-# Глобальный инстанс логгера для импорта в другие модули
+
+def setup_raw_logger() -> logging.Logger:
+    """
+    Логгер исключительно для записи сырых текстов сигналов.
+    Решает проблему конкурентной записи в файл при одновременных сообщениях.
+    """
+    logger = logging.getLogger("RawSignals")
+    logger.setLevel(logging.INFO)
+    
+    # Предотвращаем дублирование обработчиков
+    if logger.handlers:
+        return logger
+
+    # Пишем в отдельный файл без лишних префиксов (только время и текст)
+    formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    
+    # Файловый обработчик с РОТАЦИЕЙ для сырых сигналов
+    log_path = os.path.join(LOG_DIR, "signals_raw.log")
+    file_handler = RotatingFileHandler(
+        log_path, 
+        maxBytes=10 * 1024 * 1024, # 10 МБ
+        backupCount=3, 
+        encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    return logger
+
+
+# Глобальные инстансы логгеров для импорта в другие модули
 bot_logger = setup_logger()
+raw_logger = setup_raw_logger()
