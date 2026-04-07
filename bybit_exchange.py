@@ -24,12 +24,6 @@ class BybitExchange:
     def __init__(self, initial_limit: float, trades_db: TradesDatabase, settings_db: SettingsDatabase, coins_db: CoinsDatabase, notifier: Any) -> None:
         """
         Инициализация биржевого клиента и локальных кэшей.
-        
-        :param initial_limit: Базовый лимит депозита на одну сделку (в USDT).
-        :param trades_db: Объект базы данных активных и закрытых сделок.
-        :param settings_db: Объект базы данных настроек торговой стратегии.
-        :param coins_db: Объект базы данных разрешенных монет (Whitelist).
-        :param notifier: Объект для отправки уведомлений.
         """
         self.db = trades_db
         self.settings = settings_db
@@ -61,11 +55,7 @@ class BybitExchange:
             self.trade_limit = float(saved_limit)
 
     async def _get_dca_grid(self) -> Dict[str, Any]:
-        """
-        Загрузка динамических настроек сетки DCA и Take Profit из базы данных.
-        
-        :return: Словарь с целевым профитом, объемами для шагов и уровнями отклонений.
-        """
+        """Загрузка динамических настроек сетки DCA и Take Profit из базы данных."""
         return {
             "tp_target": float(await self.settings.get("tp_target", "0.7")),
             "volumes": [
@@ -82,10 +72,7 @@ class BybitExchange:
         }
 
     async def _api_call(self, func: Any, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        """
-        Централизованная обертка для асинхронного вызова синхронных методов pybit.
-        Обеспечивает перехват сетевых ошибок и стандартизированное логирование.
-        """
+        """Централизованная обертка для асинхронного вызова синхронных методов pybit."""
         try:
             res = await asyncio.to_thread(func, *args, **kwargs)
             if isinstance(res, dict) and res.get('retCode') != 0:
@@ -96,10 +83,7 @@ class BybitExchange:
             return {'retCode': -1, 'retMsg': str(e)}
 
     async def _ensure_leverage(self, symbol: str, target_leverage: int) -> bool:
-        """
-        Проверка текущего кредитного плеча и его установка только при необходимости.
-        Идемпотентная операция: предотвращает ошибку 110043 (leverage not modified).
-        """
+        """Проверка текущего кредитного плеча и его установка только при необходимости."""
         if self.leverage_cache.get(symbol) == target_leverage:
             return True
 
@@ -126,7 +110,7 @@ class BybitExchange:
         return True 
 
     async def check_connection(self) -> bool:
-        """Проверка связи с API Bybit путем запроса баланса USDT."""
+        """Проверка связи с API Bybit."""
         res = await self._api_call(self.session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
         return res.get('retCode') == 0
 
@@ -137,11 +121,37 @@ class BybitExchange:
         bot_logger.info(f"Лимит на сделку обновлен: ${new_limit}")
 
     async def get_real_equity(self) -> float:
-        """Получение реального баланса аккаунта (Equity) с учетом плавающего PNL."""
+        """
+        Получение реального баланса аккаунта (Equity).
+        Оставлено для совместимости с модулем notifier.
+        """
+        equity, _ = await self.get_balance_info()
+        return equity
+
+    async def get_balance_info(self) -> Tuple[float, float]:
+        """Получение реального баланса (Equity) и свободных для торговли средств."""
         res = await self._api_call(self.session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
-        if res.get('retCode') == 0: 
-            return float(res['result']['list'][0]['coin'][0]['equity'])
-        return 0.0
+        if res.get('retCode') == 0 and res.get('result', {}).get('list'):
+            coin_data = res['result']['list'][0]['coin'][0]
+            
+            # Эквити (Баланс + Нереализованный PNL)
+            equity = float(coin_data.get('equity', 0.0))
+            
+            # Маржа, заблокированная в открытых позициях (с учетом плеча)
+            pos_margin = float(coin_data.get('totalPositionIM', 0.0))
+            
+            # Маржа, заблокированная в лимитных ордерах (наши сетки DCA)
+            order_margin = float(coin_data.get('totalOrderIM', 0.0))
+            
+            # Чистые свободные средства для торговли
+            available = equity - pos_margin - order_margin
+            
+            # Защита от отрицательных значений при сильных просадках
+            available = max(0.0, available)
+            
+            return equity, available
+            
+        return 0.0, 0.0
 
     async def load_active_positions(self) -> None:
         """Синхронизация локального кэша активных сделок с базой данных."""
@@ -158,11 +168,14 @@ class BybitExchange:
         bot_logger.info(f"Загружено активных позиций из БД: {len(self.active_positions)}")
 
     async def fetch_live_stats(self) -> None:
-        """Асинхронный опрос биржи для получения нереализованного PNL."""
+        """Асинхронный опрос биржи для получения нереализованного PNL и цены маркировки."""
         res = await self._api_call(self.session.get_positions, category="linear", settleCoin="USDT")
         if res.get('retCode') == 0:
             self.live_stats = {
-                p['symbol']: {"unrealisedPnl": float(p['unrealisedPnl'])} 
+                p['symbol']: {
+                    "unrealisedPnl": float(p['unrealisedPnl']),
+                    "markPrice": float(p['markPrice'])
+                } 
                 for p in res['result']['list'] if float(p['size']) > 0
             }
 
@@ -179,7 +192,7 @@ class BybitExchange:
         return self.instrument_info_cache[symbol], self.price_step_cache[symbol]
 
     def _round_value(self, value: float, step: float) -> float:
-        """Математическая функция округления цены или объема до требуемой точности."""
+        """Математическая функция округления."""
         precision = int(abs(math.log10(step))) if step < 1 else 0
         return round(math.floor(value / step) * step, precision)
 
@@ -232,7 +245,6 @@ class BybitExchange:
         
         coin_alias = coin_info.get("alias") or coin
 
-        # Защита от дублирования сделок
         if await self.db.get_trading_trade(coin_alias):
             bot_logger.warning(f"Пропуск {signal_type} для {coin_alias}: активная сделка уже существует.")
             return
@@ -298,7 +310,6 @@ class BybitExchange:
             try:
                 open_trades = await self.db.get_open_trades()
                 for trade in open_trades:
-                    # Защита от спама API Bybit: небольшая задержка перед проверкой каждой монеты
                     await asyncio.sleep(0.1) 
                     await self._process_trade_fills(trade)
             except Exception as e:
@@ -335,8 +346,6 @@ class BybitExchange:
         
         next_step = int(trade["step"]) + 1
         
-        # Обновление средней цены (обязательно с await, так как fill_inv нужен для мат. формул)
-        # Обрати внимание, что fee может быть 0.0, если биржа не вернула, это не сломает расчет.
         await self.db.update_trade_dca(coin, next_step, filled_p, filled_inv, fee)
         updated = await self.db.get_trading_trade(coin)
         
@@ -370,3 +379,65 @@ class BybitExchange:
         
         await self.notifier.send(f"⚖️ <b>DCA #{next_step}: {coin}</b>\nСр.цена: {updated['avg_p']:.4f}\nНовый TP: {new_tp}")
         await self.load_active_positions()
+
+    async def get_active_open_orders(self) -> dict:
+        """Возвращает словарь открытых лимитных ордеров (TP и DCA)."""
+        open_orders = {}
+        try:
+            res = await self._api_call(self.session.get_open_orders, category="linear", settleCoin="USDT")
+            if res.get('retCode') == 0:
+                for ord in res['result']['list']:
+                    sym = ord['symbol']
+                    if sym not in open_orders:
+                        open_orders[sym] = {'tp': None, 'dca': None}
+                    if ord['side'] == 'Sell':
+                        open_orders[sym]['tp'] = float(ord['price'])
+                    elif ord['side'] == 'Buy':
+                        open_orders[sym]['dca'] = float(ord['price'])
+        except Exception as e:
+            bot_logger.error(f"EXCHANGE: Ошибка получения открытых ордеров: {e}")
+        return open_orders
+
+    async def get_last_price(self, coin: str, default: float = 0.0) -> float:
+        """Безопасно возвращает последнюю цену инструмента (lastPrice)."""
+        try:
+            res = await self._api_call(self.session.get_tickers, category="linear", symbol=coin)
+            if res.get('retCode') == 0:
+                return float(res['result']['list'][0]['lastPrice'])
+        except Exception:
+            pass
+        return default
+
+    async def emergency_close_position(self, coin: str) -> dict:
+        """Экстренное закрытие позиции по рынку."""
+        try:
+            trade = await self.db.get_trading_trade(coin)
+            if not trade:
+                return {"status": "error", "message": "Активная позиция не найдена в БД"}
+
+            await self._cancel_order_safe(coin, trade["tp_order_id"])
+            await self._cancel_order_safe(coin, trade["dca_order_id"])
+
+            current_price = await self.get_last_price(coin)
+
+            pos_res = await self._api_call(self.session.get_positions, category="linear", symbol=coin)
+            if pos_res.get('retCode') == 0 and pos_res.get('result', {}).get('list'):
+                size = float(pos_res['result']['list'][0]['size'])
+                if size > 0:
+                    close_order = await self._api_call(
+                        self.session.place_order,
+                        category="linear", symbol=coin, side="Sell", orderType="Market", qty=str(size), reduceOnly=True
+                    )
+                    
+                    if close_order.get('retCode') == 0:
+                        _, _, net = await self.db.close_trade(coin, current_price)
+                        await self.load_active_positions()
+                        bot_logger.info(f"🚨 Экстренное закрытие {coin} через WebUI выполнено. PNL: {net:.2f}")
+                        return {"status": "ok", "message": f"Позиция закрыта. PNL: {net:.2f}"}
+                    else:
+                        return {"status": "error", "message": close_order.get('retMsg')}
+                        
+            return {"status": "error", "message": "Размер позиции 0 или не удалось получить"}
+        except Exception as e:
+            bot_logger.error(f"EXCHANGE: Ошибка экстренного закрытия {coin}: {e}")
+            return {"status": "error", "message": str(e)}

@@ -49,20 +49,19 @@ def _safe_convert(func: Any, value: Any, default: Any) -> Any:
 @app.get("/api/settings")
 async def get_settings() -> Dict[str, Any]:
     if not settings_db_i:
-        bot_logger.error("WEB: /api/settings - Контекст БД настроек НЕ установлен!")
         return {}
     try:
         return {
             "allow_open": await settings_db_i.get("allow_open", "False") == "True",
             "allow_dca": await settings_db_i.get("allow_dca", "False") == "True",
-            "trade_limit": _safe_convert(float, await settings_db_i.get("trade_limit"), config.DEPO_USDT),
+            "trade_limit": _safe_convert(float, await settings_db_i.get("trade_limit"), getattr(config, 'DEPO_USDT', 100.0)),
             "leverage": _safe_convert(int, await settings_db_i.get("leverage"), getattr(config, 'LEVERAGE', 10)),
             "tp_target": _safe_convert(float, await settings_db_i.get("tp_target"), 1.5),
             
-            "dca_0": _safe_convert(float, await settings_db_i.get("dca_0"), 2.0),
-            "dca_1": _safe_convert(float, await settings_db_i.get("dca_1"), 4.0),
-            "dca_2": _safe_convert(float, await settings_db_i.get("dca_2"), 8.0),
-            "dca_3": _safe_convert(float, await settings_db_i.get("dca_3"), 16.0),
+            "dca_0": _safe_convert(float, await settings_db_i.get("dca_0"), getattr(config, 'TRADE_PERCENT_1', 2.0)),
+            "dca_1": _safe_convert(float, await settings_db_i.get("dca_1"), getattr(config, 'TRADE_PERCENT_2', 4.0)),
+            "dca_2": _safe_convert(float, await settings_db_i.get("dca_2"), getattr(config, 'TRADE_PERCENT_4', 8.0)),
+            "dca_3": _safe_convert(float, await settings_db_i.get("dca_3"), getattr(config, 'TRADE_PERCENT_8', 16.0)),
             
             "dca_level_1": _safe_convert(float, await settings_db_i.get("dca_level_1"), 3.5),
             "dca_level_2": _safe_convert(float, await settings_db_i.get("dca_level_2"), 6.5),
@@ -132,10 +131,18 @@ async def get_data():
     if not all([exchange_i, trades_db_i, settings_db_i, db_i]): 
         return {}
     
-    await exchange_i.fetch_live_stats()
-    eq = await exchange_i.get_real_equity()
-    limit = await settings_db_i.get("trade_limit", config.DEPO_USDT)
+    limit = await settings_db_i.get("trade_limit", getattr(config, 'DEPO_USDT', 100.0))
     
+    # ПАРАЛЛЕЛЬНЫЙ ЗАПРОС с получением Доступного Баланса
+    eq_task = asyncio.create_task(exchange_i.get_balance_info())
+    orders_task = asyncio.create_task(exchange_i.get_active_open_orders())
+    stats_task = asyncio.create_task(exchange_i.fetch_live_stats())
+    
+    await asyncio.gather(eq_task, orders_task, stats_task)
+    
+    eq, available_balance = eq_task.result()
+    open_orders = orders_task.result()
+
     sigs = []
     try:
         async with aiosqlite.connect(db_i.db_name) as db:
@@ -147,21 +154,64 @@ async def get_data():
 
     positions_data = {}
     for coin, p in exchange_i.active_positions.items():
-        live = exchange_i.live_stats.get(coin, {"unrealisedPnl": 0.0})
-        gross = live["unrealisedPnl"]
+        live = exchange_i.live_stats.get(coin, {})
+        gross = float(live.get("unrealisedPnl", 0.0))
+        
         open_fee = p.get("open_fee", 0.0)
+        funding_fee = p.get("funding_fee", 0.0)
+        
+        current_price = float(live.get("markPrice", p["avg_price"]))
+
+        trade = await trades_db_i.get_trading_trade(coin)
+        trade_dict = dict(trade) if trade else {}
+        
+        actual_tp = open_orders.get(coin, {}).get('tp')
+        actual_dca = open_orders.get(coin, {}).get('dca')
+
+        target_p = actual_tp or p.get("target_price") or trade_dict.get("target_p", 0.0)
+        
+        tp_est_pnl = 0.0
+        if target_p and p["avg_price"] > 0:
+            est_gross = p["invested"] * (target_p / p["avg_price"] - 1)
+            tp_est_pnl = est_gross - open_fee - funding_fee - open_fee 
+            
+        step = p["step"]
+        dca_info = []
+        for i in range(1, 4):
+            if i <= step:
+                price = trade_dict.get(f"dca{i}_p") or 0.0
+                status, status_code = "Исполнено", 2
+            elif i == step + 1:
+                price = actual_dca
+                if price:
+                    status, status_code = "Ордер (В стакане)", 1
+                else:
+                    status, status_code = "Ожидание", 0
+            else:
+                price = None
+                status, status_code = "Нет", -1
+                
+            dca_info.append({
+                "level": i, "price": price, "status": status, "status_code": status_code
+            })
+
         positions_data[coin] = {
-            "step": p["step"], 
+            "step": step, 
             "invested": p["invested"], 
             "avg_price": p["avg_price"], 
-            "target_price": p["target_price"], 
+            "current_price": current_price,
+            "target_price": target_p, 
+            "tp_est_pnl": tp_est_pnl,
             "open_fee": open_fee, 
+            "funding": funding_fee, 
             "gross_pnl": gross, 
-            "net_pnl": gross - open_fee
+            "net_pnl": gross - open_fee - funding_fee,
+            "dca": dca_info
         }
         
     return {
         "equity": eq, 
+        "available_balance": available_balance,
         "settings": {"limit": float(limit)}, 
         "positions": positions_data, 
         "recent_signals": sigs
@@ -177,7 +227,6 @@ async def get_history():
     hist, chart = [], []
     total_net_pnl = 0.0
     
-    # Словарик для статистики PNL
     stats = {"1d": 0.0, "7d": 0.0, "30d": 0.0, "365d": 0.0, "total": 0.0}
     now = datetime.now(timezone.utc)
     
@@ -187,7 +236,6 @@ async def get_history():
         total_net_pnl += net
         stats["total"] += net
         
-        # Парсим дату и раскидываем профит по корзинам времени
         try:
             created_str = t['created_at'].replace('Z', '+00:00')
             dt = datetime.fromisoformat(created_str)
@@ -200,7 +248,7 @@ async def get_history():
             if delta <= timedelta(days=30): stats["30d"] += net
             if delta <= timedelta(days=365): stats["365d"] += net
         except Exception:
-            pass # Игнорируем ошибки парсинга для сломанных старых записей
+            pass
         
         hist.append({
             "time": t['created_at'], 
@@ -218,7 +266,6 @@ async def get_history():
         })
         chart.append({"time": t['created_at'], "total": round(total_net_pnl, 2)})
         
-    # Округляем статистику перед отправкой
     for k in stats:
         stats[k] = round(stats[k], 2)
         
@@ -227,41 +274,8 @@ async def get_history():
 
 @app.post("/api/positions/{coin}/close")
 async def close_position_manual(coin: str):
-    """Экстренное закрытие позиции по рынку по нажатию кнопки в UI."""
-    if not exchange_i or not trades_db_i:
-        return {"status": "error", "message": "Контекст не инициализирован"}
-        
-    try:
-        trade = await trades_db_i.get_trading_trade(coin)
-        if not trade:
-            return {"status": "error", "message": "Активная позиция не найдена в БД"}
-
-        await exchange_i._cancel_order_safe(coin, trade["tp_order_id"])
-        await exchange_i._cancel_order_safe(coin, trade["dca_order_id"])
-        
-        res = await exchange_i._api_call(exchange_i.session.get_tickers, category="linear", symbol=coin)
-        if res.get('retCode') != 0:
-            return {"status": "error", "message": "Не удалось получить текущую цену"}
-        current_price = float(res['result']['list'][0]['lastPrice'])
-        
-        pos_res = await exchange_i._api_call(exchange_i.session.get_positions, category="linear", symbol=coin)
-        if pos_res.get('retCode') == 0 and pos_res.get('result', {}).get('list'):
-            size = float(pos_res['result']['list'][0]['size'])
-            if size > 0:
-                close_order = await exchange_i._api_call(
-                    exchange_i.session.place_order,
-                    category="linear", symbol=coin, side="Sell", orderType="Market", qty=str(size), reduceOnly=True
-                )
-                
-                if close_order.get('retCode') == 0:
-                    _, _, net = await trades_db_i.close_trade(coin, current_price)
-                    await exchange_i.load_active_positions()
-                    return {"status": "ok", "message": f"Позиция закрыта. PNL: {net:.2f}"}
-                else:
-                    return {"status": "error", "message": close_order.get('retMsg')}
-                    
-        return {"status": "error", "message": "Не удалось определить размер позиции (Возможно, 0)"}
-        
-    except Exception as e:
-        bot_logger.error(f"WEB: Ошибка закрытия позиции {coin}: {e}")
-        return {"status": "error", "message": str(e)}
+    """Экстренное закрытие позиции по рынку (Вызывает инкапсулированный метод биржи)."""
+    if not exchange_i:
+        return {"status": "error", "message": "Контекст биржи не инициализирован"}
+    
+    return await exchange_i.emergency_close_position(coin)

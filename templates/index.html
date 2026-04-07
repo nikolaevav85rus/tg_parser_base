@@ -14,10 +14,15 @@
         .chart-container { position: relative; height: 180px; width: 100%; }
         .card-header { background-color: #252525; color: #ffffff !important; font-weight: bold; border-bottom: 1px solid #444; }
         .fees-text { color: #ffab00; font-size: 0.8rem; }
-        /* Стили для нового блока PNL */
         .pnl-stats-box { background: #222; padding: 4px 15px; border-radius: 6px; border: 1px solid #333; font-size: 0.85rem;}
         .pnl-stats-box span { margin-right: 15px; color: #aaa; }
         .pnl-stats-box span:last-child { margin-right: 0; }
+        
+        /* Цвета Сетки DCA */
+        .dca-exec { color: #00e676; }
+        .dca-order { color: #ffab00; }
+        .dca-wait { color: #aaaaaa; } 
+        .dca-none { color: #888888; } 
     </style>
 </head>
 <body>
@@ -25,18 +30,25 @@
     <div class="container-fluid">
         <a class="navbar-brand" href="/">🤖 AlgoBot Dashboard</a>
         <div class="d-flex align-items-center">
-            
-            <div class="d-none d-xl-flex pnl-stats-box me-4 align-items-center">
+            <div class="d-none d-xl-flex pnl-stats-box me-3 align-items-center">
                 <span>1D: <strong id="pnl1d">$0.00</strong></span>
                 <span>7D: <strong id="pnl7d">$0.00</strong></span>
                 <span>30D: <strong id="pnl30d">$0.00</strong></span>
                 <span>1Y: <strong id="pnl365d">$0.00</strong></span>
                 <span>Total PNL: <strong id="pnltotal">$0.00</strong></span>
             </div>
+            
+            <div class="d-flex align-items-center me-4" style="border-left: 1px solid #444; padding-left: 15px; line-height: 1.2;">
+                <div class="me-3">
+                    <span style="font-size: 0.75rem; color: #888;">Общий баланс (Equity)</span><br>
+                    <strong class="text-success" style="font-size: 1.1rem;" id="equityDisplay">...</strong>
+                </div>
+                <div>
+                    <span style="font-size: 0.75rem; color: #888;">Доступно для маржи</span><br>
+                    <strong style="color: #4fc3f7; font-size: 1.1rem;" id="availableDisplay">...</strong>
+                </div>
+            </div>
 
-            <span class="me-4" style="font-size: 1.1rem; border-left: 1px solid #444; padding-left: 15px;">
-                Баланс: <strong class="text-success" id="equityDisplay">$0.00</strong>
-            </span>
             <a href="/settings" class="btn btn-sm btn-outline-secondary">⚙️ Настройки</a>
         </div>
     </div>
@@ -57,18 +69,32 @@
             <div class="card mb-4">
                 <div class="card-header py-2">СИГНАЛЫ (Live)</div>
                 <div class="card-body p-0" style="max-height: 800px; overflow-y: auto;">
-                    <ul class="list-group list-group-flush" id="signalsList"></ul>
+                    <ul class="list-group list-group-flush" id="signalsList">
+                        <li class="list-group-item bg-transparent text-muted text-center py-3">⏳ Ожидание сигналов...</li>
+                    </ul>
                 </div>
             </div>
         </div>
         
         <div class="col-md-9">
             <div class="card mb-3">
-                <div class="card-header py-2">АКТИВНЫЕ ПОЗИЦИИ (Live PNL)</div>
+                <div class="card-header py-2">АКТИВНЫЕ ПОЗИЦИИ (Live Data)</div>
                 <div class="card-body p-0">
                     <table class="table table-dark mb-0 table-hover">
-                        <thead><tr><th>Монета</th><th>Ср. цена</th><th>Шаг DCA</th><th>Объем</th><th>Комиссии (Откр+Фанд)</th><th>Gross PNL</th><th>Net PNL</th><th>Действие</th></tr></thead>
-                        <tbody id="positionsTable"></tbody>
+                        <thead>
+                            <tr>
+                                <th>Монета</th>
+                                <th>Цена (Тек / Ср)</th>
+                                <th>Take Profit / План</th>
+                                <th>Сетка DCA (Уровни)</th>
+                                <th>Объем / Комиссии</th>
+                                <th>PNL (Net / Gross)</th>
+                                <th class="text-center">Действие</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positionsTable">
+                            <tr><td colspan="7" class="text-center py-4" style="color: #00e676;">⏳ Получение данных с биржи...</td></tr>
+                        </tbody>
                     </table>
                 </div>
             </div>
@@ -76,7 +102,7 @@
                 <div class="card-header py-2">ЖУРНАЛ ЗАКРЫТЫХ СДЕЛОК</div>
                 <div class="card-body p-0">
                     <table class="table table-dark mb-0 table-hover">
-                        <thead><tr><th>Время</th><th>Монета</th><th>Вход</th><th>Выход</th><th>Объем</th><th>Gross PNL</th><th>Комиссии (Откр/Фанд/Закр)</th><th>Net PNL</th></tr></thead>
+                        <thead><tr><th>Время</th><th>Монета</th><th>Вход</th><th>Выход</th><th>Объем</th><th>Gross PNL</th><th>Комиссии (O/F/C)</th><th>Net PNL</th></tr></thead>
                         <tbody id="historyTable"></tbody>
                     </table>
                 </div>
@@ -107,13 +133,11 @@ function formatTime(isoString, timeOnly=false) {
 function formatPrice(p) { return p ? Number(p.toFixed(6)).toString() : '-'; }
 
 function closePosition(coin) {
-    if (confirm(`Вы уверены, что хотите закрыть позицию по ${coin} по рынку? Все связанные ордера будут отменены.`)) {
+    if (confirm(`Вы уверены, что хотите закрыть позицию по ${coin} по рынку? Все ордера будут отменены.`)) {
         fetch(`/api/positions/${coin}/close`, { method: 'POST' })
         .then(r => r.json())
         .then(res => {
-            if (res.status !== 'ok') {
-                alert(`Ошибка при закрытии ${coin}: ${res.message || 'Неизвестная ошибка'}`);
-            }
+            if (res.status !== 'ok') alert(`Ошибка при закрытии: ${res.message}`);
             updateData(); 
         });
     }
@@ -122,38 +146,80 @@ function closePosition(coin) {
 function updateData() {
     fetch('/api/data').then(r=>r.json()).then(data => {
         document.getElementById('equityDisplay').innerText = '$' + data.equity.toFixed(2);
+        
+        // Обновляем значение свободного баланса
+        let availElem = document.getElementById('availableDisplay');
+        if(availElem) {
+            availElem.innerText = '$' + (data.available_balance !== undefined ? data.available_balance : 0).toFixed(2);
+        }
 
         let sigHTML = '';
-        data.recent_signals.forEach(s => {
-            let color = s.type === 'CLOSE' ? 'text-danger' : (s.type === 'OPEN' ? 'text-success' : 'text-warning');
-            sigHTML += `<li class="list-group-item bg-transparent text-light border-secondary"><div class="d-flex justify-content-between">
-                <strong class="${color}">${s.type}</strong><small style="color:#b0b0b0;">${formatTime(s.time)}</small></div>
-                <div class="mt-1">${s.coin} @ ${formatPrice(s.price)}</div></li>`;
-        });
+        if (data.recent_signals.length === 0) {
+            sigHTML = '<li class="list-group-item bg-transparent text-muted text-center py-3">Нет недавних сигналов</li>';
+        } else {
+            data.recent_signals.forEach(s => {
+                let color = s.type === 'CLOSE' ? 'text-danger' : (s.type === 'OPEN' ? 'text-success' : 'text-warning');
+                sigHTML += `<li class="list-group-item bg-transparent text-light border-secondary"><div class="d-flex justify-content-between">
+                    <strong class="${color}">${s.type}</strong><small style="color:#b0b0b0;">${formatTime(s.time)}</small></div>
+                    <div class="mt-1">${s.coin} @ ${formatPrice(s.price)}</div></li>`;
+            });
+        }
         document.getElementById('signalsList').innerHTML = sigHTML;
 
         let posHTML = '';
         for (let coin in data.positions) {
             let p = data.positions[coin];
             let badge = p.step === 0 ? 'badge-open' : 'badge-dca';
-            let gClass = p.gross_pnl >= 0 ? 'text-success' : 'text-danger';
             let nClass = p.net_pnl >= 0 ? 'text-success' : 'text-danger';
+            let tpClass = p.tp_est_pnl >= 0 ? 'text-success' : 'text-danger';
             
-            posHTML += `<tr><td><strong>${coin}</strong></td><td>${formatPrice(p.avg_price)}</td>
-                <td><span class="badge ${badge}">Шаг ${p.step}</span></td><td>$${p.invested.toFixed(2)}</td>
-                <td class="fees-text">-$${(p.open_fee + p.funding).toFixed(3)} <br><small>(O: ${p.open_fee.toFixed(3)} | F: ${p.funding.toFixed(3)})</small></td>
-                <td class="${gClass}">$${p.gross_pnl.toFixed(2)}</td>
-                <td class="${nClass}"><strong>$${p.net_pnl.toFixed(2)}</strong></td>
-                <td class="text-center"><button class="btn btn-sm btn-outline-danger" onclick="closePosition('${coin}')">Закрыть</button></td></tr>`;
+            // Сборка HTML для статусов DCA
+            let dcaHTML = '<div style="font-size: 0.8rem; line-height: 1.3;">';
+            if (p.dca && p.dca.length > 0) {
+                p.dca.forEach(d => {
+                    let cssClass = 'dca-none';
+                    if(d.status_code === 2) cssClass = 'dca-exec';
+                    else if(d.status_code === 1) cssClass = 'dca-order';
+                    else if(d.status_code === 0) cssClass = 'dca-wait';
+                    
+                    let text = '';
+                    if (d.status_code === -1) text = '---';
+                    else if (!d.price) text = d.status;
+                    else text = `${formatPrice(d.price)} (${d.status})`;
+                    
+                    dcaHTML += `<div class="${cssClass}"><strong>[${d.level}]</strong> ${text}</div>`;
+                });
+            }
+            dcaHTML += '</div>';
+
+            posHTML += `<tr>
+                <td><strong>${coin}</strong><br><span class="badge ${badge} mt-1">Шаг ${p.step}</span></td>
+                <td>
+                    <span style="color: #4fc3f7;">Тек: ${formatPrice(p.current_price)}</span><br>
+                    <span style="color: #b0b0b0; font-size: 0.85rem;">Ср: ${formatPrice(p.avg_price)}</span>
+                </td>
+                <td>
+                    <span class="text-light">${formatPrice(p.target_price)}</span><br>
+                    <span class="${tpClass}">~ $${p.tp_est_pnl.toFixed(2)} Net</span>
+                </td>
+                <td>${dcaHTML}</td>
+                <td>
+                    $${p.invested.toFixed(2)}<br>
+                    <span class="fees-text">Fees: -$${(p.open_fee + p.funding).toFixed(3)}</span>
+                </td>
+                <td>
+                    <strong class="${nClass}">$${p.net_pnl.toFixed(2)}</strong><br>
+                    <span style="color: #a0a0a0; font-size: 0.8rem;">Gr: $${p.gross_pnl.toFixed(2)}</span>
+                </td>
+                <td class="text-center align-middle"><button class="btn btn-sm btn-outline-danger" onclick="closePosition('${coin}')">Закрыть</button></td>
+            </tr>`;
         }
-        document.getElementById('positionsTable').innerHTML = posHTML || '<tr><td colspan="8" class="text-center text-muted">Нет открытых сделок</td></tr>';
+        document.getElementById('positionsTable').innerHTML = posHTML || '<tr><td colspan="7" class="text-center py-4" style="color: #888888;">Нет открытых сделок</td></tr>';
     });
 }
 
 function updateHistory() {
     fetch('/api/history').then(r=>r.json()).then(data => {
-        
-        // НОВЫЙ БЛОК: Обновление статистики PNL
         if (data.stats) {
             const periods = ['1d', '7d', '30d', '365d', 'total'];
             periods.forEach(p => {
@@ -177,7 +243,7 @@ function updateHistory() {
                 <td>${formatPrice(t.avg)}</td><td>${formatPrice(t.exit)}</td>
                 <td>$${t.total_inv.toFixed(1)}</td>
                 <td class="${gClass}">$${t.gross_pnl.toFixed(2)}<br><small>${t.pnl_p}%</small></td>
-                <td class="fees-text">-$${(t.open_fee+t.fund_fee+t.close_fee).toFixed(3)}<br><small>(${t.open_fee.toFixed(3)} / ${t.fund_fee.toFixed(3)} / ${t.close_fee.toFixed(3)})</small></td>
+                <td class="fees-text">-$${(t.open_fee+t.fund_fee+t.close_fee).toFixed(3)}</td>
                 <td class="${nClass}"><strong>${t.net_pnl>=0?'+':''}$${t.net_pnl.toFixed(2)}</strong></td>
             </tr>`;
         });
