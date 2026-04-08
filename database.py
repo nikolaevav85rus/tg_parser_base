@@ -235,6 +235,7 @@ class SettingsDatabase:
             "dca_0": "2", "dca_1": "4", "dca_2": "8", "dca_3": "16",
             "dca_level_1": "3.5", "dca_level_2": "6.5", "dca_level_3": "14.5",
             "tp_target": "1.5",
+            "max_active_trades": "3", # ДОБАВЛЕНО: Лимит сделок по умолчанию
         }
         
         async with aiosqlite.connect(self.db_name) as db:

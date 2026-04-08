@@ -30,7 +30,6 @@ class BybitExchange:
         self.coins_db = coins_db
         self.notifier = notifier
         
-        # Инициализация HTTP клиента Bybit v5
         self.session = HTTP(
             testnet=config.BYBIT_TESTNET, 
             api_key=config.BYBIT_API_KEY, 
@@ -38,8 +37,6 @@ class BybitExchange:
         )
         
         self.trade_limit = initial_limit
-        
-        # Словари для хранения данных в памяти (кэширование)
         self.active_positions: Dict[str, Dict[str, Any]] = {}       
         self.instrument_info_cache: Dict[str, float] = {}  
         self.price_step_cache: Dict[str, float] = {}       
@@ -115,46 +112,26 @@ class BybitExchange:
         return res.get('retCode') == 0
 
     async def update_limit(self, new_limit: float) -> None:
-        """Обновление лимита депозита в оперативной памяти и БД."""
         self.trade_limit = new_limit
         await self.settings.set("trade_limit", new_limit)
         bot_logger.info(f"Лимит на сделку обновлен: ${new_limit}")
 
     async def get_real_equity(self) -> float:
-        """
-        Получение реального баланса аккаунта (Equity).
-        Оставлено для совместимости с модулем notifier.
-        """
         equity, _ = await self.get_balance_info()
         return equity
 
     async def get_balance_info(self) -> Tuple[float, float]:
-        """Получение реального баланса (Equity) и свободных для торговли средств."""
         res = await self._api_call(self.session.get_wallet_balance, accountType="UNIFIED", coin="USDT")
         if res.get('retCode') == 0 and res.get('result', {}).get('list'):
             coin_data = res['result']['list'][0]['coin'][0]
-            
-            # Эквити (Баланс + Нереализованный PNL)
             equity = float(coin_data.get('equity', 0.0))
-            
-            # Маржа, заблокированная в открытых позициях (с учетом плеча)
             pos_margin = float(coin_data.get('totalPositionIM', 0.0))
-            
-            # Маржа, заблокированная в лимитных ордерах (наши сетки DCA)
             order_margin = float(coin_data.get('totalOrderIM', 0.0))
-            
-            # Чистые свободные средства для торговли
-            available = equity - pos_margin - order_margin
-            
-            # Защита от отрицательных значений при сильных просадках
-            available = max(0.0, available)
-            
+            available = max(0.0, equity - pos_margin - order_margin)
             return equity, available
-            
         return 0.0, 0.0
 
     async def load_active_positions(self) -> None:
-        """Синхронизация локального кэша активных сделок с базой данных."""
         raw = await self.db.get_open_trades()
         self.active_positions = {
             t['coin']: {
@@ -165,10 +142,8 @@ class BybitExchange:
                 "open_fee": t['open_fee']
             } for t in raw
         }
-        bot_logger.info(f"Загружено активных позиций из БД: {len(self.active_positions)}")
 
     async def fetch_live_stats(self) -> None:
-        """Асинхронный опрос биржи для получения нереализованного PNL и цены маркировки."""
         res = await self._api_call(self.session.get_positions, category="linear", settleCoin="USDT")
         if res.get('retCode') == 0:
             self.live_stats = {
@@ -180,7 +155,6 @@ class BybitExchange:
             }
 
     async def _get_instrument_info(self, symbol: str) -> Tuple[float, float]:
-        """Получение параметров инструмента (минимальный шаг объема и цены)."""
         if symbol not in self.instrument_info_cache or symbol not in self.price_step_cache:
             res = await self._api_call(self.session.get_instruments_info, category="linear", symbol=symbol)
             if res.get('retCode') == 0 and res.get('result', {}).get('list'):
@@ -192,18 +166,15 @@ class BybitExchange:
         return self.instrument_info_cache[symbol], self.price_step_cache[symbol]
 
     def _round_value(self, value: float, step: float) -> float:
-        """Математическая функция округления."""
         precision = int(abs(math.log10(step))) if step < 1 else 0
         return round(math.floor(value / step) * step, precision)
 
     def _calc_qty(self, deposit: float, percent: float, leverage: int, price: float, qty_step: float) -> float:
-        """Расчет объема ордера в монетах."""
         amount_usdt = deposit * (percent / 100.0)
         qty = (amount_usdt * leverage) / price
         return self._round_value(qty, qty_step)
 
     async def _place_limit(self, symbol: str, side: str, qty: float, price: float, reduce_only: bool = False) -> Dict[str, Any]:
-        """Отправка лимитного ордера (GTC)."""
         return await self._api_call(
             self.session.place_order,
             category="linear", symbol=symbol, side=side, orderType="Limit",
@@ -211,19 +182,16 @@ class BybitExchange:
         )
 
     async def _cancel_order_safe(self, symbol: str, order_id: Optional[str]) -> None:
-        """Безопасная отмена ордера по его ID."""
         if order_id:
             await self._api_call(self.session.cancel_order, category="linear", symbol=symbol, orderId=order_id)
 
     async def _get_open_order_ids(self, symbol: str) -> Set[str]:
-        """Получение множества ID всех открытых ордеров по монете."""
         res = await self._api_call(self.session.get_open_orders, category="linear", symbol=symbol)
         if res.get("retCode") == 0:
             return {o.get("orderId") for o in res["result"]["list"]}
         return set()
 
     async def _get_real_execution_data(self, order_id: str, symbol: str) -> Tuple[Optional[float], Optional[float], float]:
-        """Получение фактических данных об исполнении ордера."""
         await asyncio.sleep(1.2)
         res = await self._api_call(self.session.get_executions, category="linear", symbol=symbol, orderId=order_id)
         if res.get('retCode') == 0 and res.get('result', {}).get('list'):
@@ -236,7 +204,6 @@ class BybitExchange:
         return None, None, 0.0
 
     async def execute_signal(self, coin: str, signal_type: str, signal_price: float, target_price: float) -> None:
-        """Внешний интерфейс для приема торговых сигналов."""
         bot_logger.info(f"⚡ ТОРГОВЫЙ МОДУЛЬ: Получена команда {signal_type} для {coin}")
         
         coin_info = await self.coins_db.get_coin(coin)
@@ -250,10 +217,24 @@ class BybitExchange:
             return
 
         if signal_type == "OPEN":
+            # ИСПРАВЛЕНИЕ №1: Проверка главного тумблера "Разрешить новые входы"
+            allow_open = await self.settings.get("allow_open", "False") == "True"
+            if not allow_open:
+                bot_logger.info(f"Пропуск OPEN для {coin_alias}: торговля отключена в настройках.")
+                return
+                
+            # ИСПРАВЛЕНИЕ: Проверка лимита активных сделок
+            max_trades = int(await self.settings.get("max_active_trades", "3"))
+            await self.load_active_positions() # Синхронизируем количество перед проверкой
+            active_count = len(self.active_positions)
+            
+            if active_count >= max_trades:
+                bot_logger.warning(f"⛔ Пропуск OPEN для {coin_alias}: достигнут лимит активных сделок ({active_count}/{max_trades}).")
+                return
+
             await self._handle_open_signal(coin_alias)
 
     async def _handle_open_signal(self, coin: str) -> None:
-        """Логика первичного входа в позицию (Market Order)."""
         grid = await self._get_dca_grid()
         leverage = int(await self.settings.get("leverage", str(config.LEVERAGE)))
         deposit = float(await self.settings.get("trade_limit", str(self.trade_limit)))
@@ -292,19 +273,22 @@ class BybitExchange:
                 if tp_order.get("retCode") == 0:
                     await self.db.set_tp_order_id(coin, tp_order["result"]["orderId"])
 
+                # ИСПРАВЛЕНИЕ №1.1: Проверка тумблера "Разрешить усреднения" перед первым DCA
+                allow_dca = await self.settings.get("allow_dca", "False") == "True"
                 dca1_price = self._round_value(real_p * (1 - grid["levels"][0] / 100.0), price_step)
-                dca1_qty = self._calc_qty(deposit, grid["volumes"][1], leverage, dca1_price, qty_step)
-                dca_order = await self._place_limit(coin, "Buy", dca1_qty, dca1_price)
-                if dca_order.get("retCode") == 0:
-                    await self.db.set_dca_order_id(coin, dca_order["result"]["orderId"])
+                
+                if allow_dca:
+                    dca1_qty = self._calc_qty(deposit, grid["volumes"][1], leverage, dca1_price, qty_step)
+                    dca_order = await self._place_limit(coin, "Buy", dca1_qty, dca1_price)
+                    if dca_order.get("retCode") == 0:
+                        await self.db.set_dca_order_id(coin, dca_order["result"]["orderId"])
 
-                await self.notifier.send(f"🟢 <b>ВХОД: {coin}</b>\nЦена: {real_p}\nTP: {tp_price}\nDCA_1: {dca1_price}")
+                await self.notifier.send(f"🟢 <b>ВХОД: {coin}</b>\nЦена: {real_p}\nTP: {tp_price}\nПлановый DCA_1: {dca1_price}")
                 await self.load_active_positions()
         except Exception as e:
             bot_logger.error(f"Ошибка OPEN {coin}: {e}")
 
     async def monitor_fills(self) -> None:
-        """Бесконечный фоновый цикл (Daemon) для опроса статуса лимитных ордеров."""
         while True:
             await asyncio.sleep(2.0) 
             try:
@@ -316,7 +300,6 @@ class BybitExchange:
                 bot_logger.error(f"Ошибка мониторинга: {e}")
 
     async def _process_trade_fills(self, trade: Any) -> None:
-        """Определение, какой именно ордер исполнился по текущей сделке."""
         coin = trade["coin"]
         open_order_ids = await self._get_open_order_ids(coin)
 
@@ -328,7 +311,6 @@ class BybitExchange:
             await self._process_dca_execution(trade, coin)
 
     async def _process_tp_execution(self, trade: Any, coin: str) -> None:
-        """Обработка успешного закрытия сделки по Take Profit."""
         res_p, _, fee = await self._get_real_execution_data(trade["tp_order_id"], coin)
         if res_p:
             _, _, net_pnl = await self.db.close_trade(coin, res_p, fee)
@@ -339,10 +321,12 @@ class BybitExchange:
             await self.load_active_positions()
 
     async def _process_dca_execution(self, trade: Any, coin: str) -> None:
-        """Обработка усреднения (DCA)."""
         filled_p, filled_inv, fee = await self._get_real_execution_data(trade["dca_order_id"], coin)
         if not filled_p: 
             return
+        
+        # ИСПРАВЛЕНИЕ №2: Сразу очищаем dca_order_id в базе, чтобы не было "Петли смерти"
+        await self.db.set_dca_order_id(coin, None)
         
         next_step = int(trade["step"]) + 1
         
@@ -366,7 +350,10 @@ class BybitExchange:
         if tp_res.get("retCode") == 0:
             await self.db.set_tp_order_id(coin, tp_res["result"]["orderId"])
         
-        if next_step < 3: 
+        # ИСПРАВЛЕНИЕ №1.2: Проверка тумблера перед выставлением следующих DCA
+        allow_dca = await self.settings.get("allow_dca", "False") == "True"
+        
+        if allow_dca and next_step < 3: 
             next_dev = grid["levels"][next_step]
             next_vol = grid["volumes"][next_step + 1]
             
@@ -381,7 +368,6 @@ class BybitExchange:
         await self.load_active_positions()
 
     async def get_active_open_orders(self) -> dict:
-        """Возвращает словарь открытых лимитных ордеров (TP и DCA)."""
         open_orders = {}
         try:
             res = await self._api_call(self.session.get_open_orders, category="linear", settleCoin="USDT")
@@ -399,7 +385,6 @@ class BybitExchange:
         return open_orders
 
     async def get_last_price(self, coin: str, default: float = 0.0) -> float:
-        """Безопасно возвращает последнюю цену инструмента (lastPrice)."""
         try:
             res = await self._api_call(self.session.get_tickers, category="linear", symbol=coin)
             if res.get('retCode') == 0:
@@ -409,7 +394,6 @@ class BybitExchange:
         return default
 
     async def emergency_close_position(self, coin: str) -> dict:
-        """Экстренное закрытие позиции по рынку."""
         try:
             trade = await self.db.get_trading_trade(coin)
             if not trade:

@@ -58,6 +58,9 @@ async def get_settings() -> Dict[str, Any]:
             "leverage": _safe_convert(int, await settings_db_i.get("leverage"), getattr(config, 'LEVERAGE', 10)),
             "tp_target": _safe_convert(float, await settings_db_i.get("tp_target"), 1.5),
             
+            # --- ДОБАВЛЕН ЛИМИТ АКТИВНЫХ СДЕЛОК ---
+            "max_active_trades": _safe_convert(int, await settings_db_i.get("max_active_trades"), 3),
+            
             "dca_0": _safe_convert(float, await settings_db_i.get("dca_0"), getattr(config, 'TRADE_PERCENT_1', 2.0)),
             "dca_1": _safe_convert(float, await settings_db_i.get("dca_1"), getattr(config, 'TRADE_PERCENT_2', 4.0)),
             "dca_2": _safe_convert(float, await settings_db_i.get("dca_2"), getattr(config, 'TRADE_PERCENT_4', 8.0)),
