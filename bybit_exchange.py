@@ -217,13 +217,13 @@ class BybitExchange:
             return
 
         if signal_type == "OPEN":
-            # ИСПРАВЛЕНИЕ №1: Проверка главного тумблера "Разрешить новые входы"
+            # Проверка главного тумблера "Разрешить новые входы"
             allow_open = await self.settings.get("allow_open", "False") == "True"
             if not allow_open:
                 bot_logger.info(f"Пропуск OPEN для {coin_alias}: торговля отключена в настройках.")
                 return
                 
-            # ИСПРАВЛЕНИЕ: Проверка лимита активных сделок
+            # Проверка лимита активных сделок
             max_trades = int(await self.settings.get("max_active_trades", "3"))
             await self.load_active_positions() # Синхронизируем количество перед проверкой
             active_count = len(self.active_positions)
@@ -273,7 +273,7 @@ class BybitExchange:
                 if tp_order.get("retCode") == 0:
                     await self.db.set_tp_order_id(coin, tp_order["result"]["orderId"])
 
-                # ИСПРАВЛЕНИЕ №1.1: Проверка тумблера "Разрешить усреднения" перед первым DCA
+                # Проверка тумблера "Разрешить усреднения" перед первым DCA
                 allow_dca = await self.settings.get("allow_dca", "False") == "True"
                 dca1_price = self._round_value(real_p * (1 - grid["levels"][0] / 100.0), price_step)
                 
@@ -325,7 +325,7 @@ class BybitExchange:
         if not filled_p: 
             return
         
-        # ИСПРАВЛЕНИЕ №2: Сразу очищаем dca_order_id в базе, чтобы не было "Петли смерти"
+        # Сразу очищаем dca_order_id в базе, чтобы не было "Петли смерти"
         await self.db.set_dca_order_id(coin, None)
         
         next_step = int(trade["step"]) + 1
@@ -343,14 +343,28 @@ class BybitExchange:
         leverage = int(trade["leverage"])
         deposit = float(await self.settings.get("trade_limit", str(self.trade_limit)))
         
-        total_qty = self._round_value(updated["total_inv"] / updated["avg_p"], qty_step)
+        # --- ИСПРАВЛЕНИЕ: Исключаем "пыль" при закрытии ---
+        # Запрашиваем реальный объем позиции напрямую с биржи
+        real_qty = 0.0
+        pos_res = await self._api_call(self.session.get_positions, category="linear", symbol=coin)
+        
+        if pos_res.get('retCode') == 0 and pos_res.get('result', {}).get('list'):
+            real_qty = float(pos_res['result']['list'][0]['size'])
+            
+        # Если биржа ответила успешно, берем её size. 
+        # Иначе фолбэк на локальный расчет (защита от сбоев API)
+        if real_qty > 0:
+            total_qty = real_qty
+        else:
+            total_qty = self._round_value(updated["total_inv"] / updated["avg_p"], qty_step)
+        # -------------------------------------------------
         
         new_tp = self._round_value(updated["avg_p"] * (1 + grid["tp_target"] / 100.0), price_step)
         tp_res = await self._place_limit(coin, "Sell", total_qty, new_tp, reduce_only=True)
         if tp_res.get("retCode") == 0:
             await self.db.set_tp_order_id(coin, tp_res["result"]["orderId"])
         
-        # ИСПРАВЛЕНИЕ №1.2: Проверка тумблера перед выставлением следующих DCA
+        # Проверка тумблера перед выставлением следующих DCA
         allow_dca = await self.settings.get("allow_dca", "False") == "True"
         
         if allow_dca and next_step < 3: 
