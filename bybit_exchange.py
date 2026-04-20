@@ -38,12 +38,15 @@ class BybitExchange:
         )
         
         self.trade_limit = initial_limit
-        self.active_positions: Dict[str, Dict[str, Any]] = {}       
-        self.instrument_info_cache: Dict[str, float] = {}  
-        self.price_step_cache: Dict[str, float] = {}       
-        self.leverage_cache: Dict[str, int] = {}         
-        self.live_stats: Dict[str, Dict[str, float]] = {}             
-        
+        self.active_positions: Dict[str, Dict[str, Any]] = {}
+        self.instrument_info_cache: Dict[str, float] = {}
+        self.price_step_cache: Dict[str, float] = {}
+        self.leverage_cache: Dict[str, int] = {}
+        self.live_stats: Dict[str, Dict[str, float]] = {}
+
+        self._api_error_streak: int = 0
+        self._api_disconnected: bool = False
+
         bot_logger.info("Биржевой модуль BybitExchange инициализирован.")
 
     async def _init_settings(self) -> None:
@@ -75,9 +78,21 @@ class BybitExchange:
             res = await asyncio.to_thread(func, *args, **kwargs)
             if isinstance(res, dict) and res.get('retCode') != 0:
                 bot_logger.error(f"API Ошибка: {res.get('retMsg')} (Код: {res.get('retCode')})")
-            return res # type: ignore
+                return res  # type: ignore
+            # Успешный вызов — сбрасываем счётчик и уведомляем о восстановлении
+            if self._api_disconnected:
+                self._api_disconnected = False
+                bot_logger.info("✅ Связь с биржей восстановлена.")
+                await self.notifier.send("✅ <b>Связь с биржей восстановлена.</b>")
+            self._api_error_streak = 0
+            return res  # type: ignore
         except Exception as e:
             bot_logger.error(f"Сетевая/Внутренняя ошибка API: {e}")
+            self._api_error_streak += 1
+            if self._api_error_streak >= 3 and not self._api_disconnected:
+                self._api_disconnected = True
+                bot_logger.warning("🔴 Биржа недоступна — несколько запросов подряд завершились ошибкой.")
+                await self.notifier.send("🔴 <b>Биржа недоступна.</b> Проверяю соединение...")
             return {'retCode': -1, 'retMsg': str(e)}
 
     async def _ensure_leverage(self, symbol: str, target_leverage: int) -> bool:
