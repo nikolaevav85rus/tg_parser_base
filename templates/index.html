@@ -252,9 +252,9 @@ function updateHistory() {
         let ctx = document.getElementById('pnlChart').getContext('2d');
         if(pnlChart) pnlChart.destroy();
         pnlChart = new Chart(ctx, {
-            type: 'line', data: { labels: data.chart.map(d => formatTime(d.time, true)), 
+            type: 'line', data: { labels: data.chart.map(d => formatTime(d.time).split(' ')[0]),
             datasets: [{ label: 'Net PNL $', data: data.chart.map(d=>d.total), borderColor: '#00e676', backgroundColor: 'rgba(0,230,118,0.1)', fill: true, tension: 0.3, pointRadius: 2 }] },
-            options: { animation: false, maintainAspectRatio: false, scales: { x: { grid: { color: '#333' }, ticks: { color: '#bbb', maxTicksLimit: 15 } }, y: { grid: { color: '#333' }, ticks: { color: '#bbb' } } }, plugins: { legend: { display: false } } }
+            options: { animation: false, maintainAspectRatio: false, scales: { x: { grid: { color: '#333' }, ticks: { color: '#bbb', maxTicksLimit: 15, maxRotation: 0 } }, y: { grid: { color: '#333' }, ticks: { color: '#bbb' } } }, plugins: { legend: { display: false } } }
         });
     });
 }

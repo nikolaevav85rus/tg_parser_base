@@ -46,7 +46,7 @@ class TradingBot:
         self.notifier.set_tg_client(self.client)
         
         # Очередь для асинхронной обработки сигналов без блокировки хендлера Telegram
-        self.signal_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self.signal_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=config.SIGNAL_QUEUE_MAX)
 
     async def _telegram_handler(self, event: events.NewMessage.Event) -> None:
         """
@@ -126,7 +126,7 @@ class TradingBot:
             events.NewMessage(chats=config.TARGET_CHANNEL)
         )
 
-        uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning")
+        uvicorn_config = uvicorn.Config(app, host=config.WEB_HOST, port=config.WEB_PORT, log_level="warning")
         server = uvicorn.Server(uvicorn_config)
         
         bot_logger.info("🚀 Запуск всех систем бота...")

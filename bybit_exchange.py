@@ -192,7 +192,7 @@ class BybitExchange:
         return set()
 
     async def _get_real_execution_data(self, order_id: str, symbol: str) -> Tuple[Optional[float], Optional[float], float]:
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(config.EXEC_DATA_DELAY)
         res = await self._api_call(self.session.get_executions, category="linear", symbol=symbol, orderId=order_id)
         if res.get('retCode') == 0 and res.get('result', {}).get('list'):
             ex = res['result']['list']
@@ -283,18 +283,18 @@ class BybitExchange:
                     if dca_order.get("retCode") == 0:
                         await self.db.set_dca_order_id(coin, dca_order["result"]["orderId"])
 
-                await self.notifier.send(f"🟢 <b>ВХОД: {coin}</b>\nЦена: {real_p}\nTP: {tp_price}\nПлановый DCA_1: {dca1_price}")
+                await self.notifier.send(f"🟢 <b>ВХОД: {coin}</b>\nЦена: {real_p}\nОбъем: {real_inv:.2f} USDT\nTP: {tp_price}\nПлановый DCA_1: {dca1_price}")
                 await self.load_active_positions()
         except Exception as e:
             bot_logger.error(f"Ошибка OPEN {coin}: {e}")
 
     async def monitor_fills(self) -> None:
         while True:
-            await asyncio.sleep(2.0) 
+            await asyncio.sleep(config.MONITOR_INTERVAL)
             try:
                 open_trades = await self.db.get_open_trades()
                 for trade in open_trades:
-                    await asyncio.sleep(0.1) 
+                    await asyncio.sleep(0.1)
                     await self._process_trade_fills(trade)
             except Exception as e:
                 bot_logger.error(f"Ошибка мониторинга: {e}")
@@ -367,7 +367,7 @@ class BybitExchange:
         # Проверка тумблера перед выставлением следующих DCA
         allow_dca = await self.settings.get("allow_dca", "False") == "True"
         
-        if allow_dca and next_step < 3: 
+        if allow_dca and next_step < config.DCA_MAX_STEPS:
             next_dev = grid["levels"][next_step]
             next_vol = grid["volumes"][next_step + 1]
             
@@ -378,7 +378,7 @@ class BybitExchange:
             if dca_res.get("retCode") == 0:
                 await self.db.set_dca_order_id(coin, dca_res["result"]["orderId"])
         
-        await self.notifier.send(f"⚖️ <b>DCA #{next_step}: {coin}</b>\nСр.цена: {updated['avg_p']:.4f}\nНовый TP: {new_tp}")
+        await self.notifier.send(f"⚖️ <b>DCA #{next_step}: {coin}</b>\nОбъем: {filled_inv:.2f} USDT\nСр.цена: {updated['avg_p']:.4f}\nНовый TP: {new_tp}")
         await self.load_active_positions()
 
     async def get_active_open_orders(self) -> dict:

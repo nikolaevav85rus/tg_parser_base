@@ -97,3 +97,15 @@ TRADE_PERCENT_1: float = _get_float("TRADE_PERCENT_1", 2.0)
 TRADE_PERCENT_2: float = _get_float("TRADE_PERCENT_2", 4.0)
 TRADE_PERCENT_4: float = _get_float("TRADE_PERCENT_4", 8.0)
 TRADE_PERCENT_8: float = _get_float("TRADE_PERCENT_8", 16.0)
+
+# ==========================================
+# RUNTIME НАСТРОЙКИ
+# ==========================================
+WEB_HOST: str = os.getenv("WEB_HOST", "127.0.0.1")
+WEB_PORT: int = _get_int("WEB_PORT", 8000)
+SIGNAL_QUEUE_MAX: int = _get_int("SIGNAL_QUEUE_MAX", 50)
+MONITOR_INTERVAL: float = _get_float("MONITOR_INTERVAL", 2.0)
+EXEC_DATA_DELAY: float = _get_float("EXEC_DATA_DELAY", 1.2)
+DCA_MAX_STEPS: int = _get_int("DCA_MAX_STEPS", 3)
+SIGNALS_LIMIT: int = _get_int("SIGNALS_LIMIT", 50)
+NOTIFIER_POLL_INTERVAL: int = _get_int("NOTIFIER_POLL_INTERVAL", 2)

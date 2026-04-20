@@ -13,17 +13,13 @@ from logger import bot_logger
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
-# Глобальные переменные контекста
-db_i = None
-exchange_i = None
-trades_db_i = None
-settings_db_i = None
-coins_db_i = None
-
 def set_context(d: Any, e: Any, t: Any, s: Any, c: Any) -> None:
-    """Установка контекста баз данных и биржи для использования в роутах."""
-    global db_i, exchange_i, trades_db_i, settings_db_i, coins_db_i
-    db_i, exchange_i, trades_db_i, settings_db_i, coins_db_i = d, e, t, s, c
+    """Установка контекста баз данных и биржи через app.state."""
+    app.state.db = d
+    app.state.exchange = e
+    app.state.trades_db = t
+    app.state.settings_db = s
+    app.state.coins = c
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -48,27 +44,27 @@ def _safe_convert(func: Any, value: Any, default: Any) -> Any:
 
 @app.get("/api/settings")
 async def get_settings() -> Dict[str, Any]:
-    if not settings_db_i:
+    if not app.state.settings_db:
         return {}
     try:
         return {
-            "allow_open": await settings_db_i.get("allow_open", "False") == "True",
-            "allow_dca": await settings_db_i.get("allow_dca", "False") == "True",
-            "trade_limit": _safe_convert(float, await settings_db_i.get("trade_limit"), getattr(config, 'DEPO_USDT', 100.0)),
-            "leverage": _safe_convert(int, await settings_db_i.get("leverage"), getattr(config, 'LEVERAGE', 10)),
-            "tp_target": _safe_convert(float, await settings_db_i.get("tp_target"), 1.5),
+            "allow_open": await app.state.settings_db.get("allow_open", "False") == "True",
+            "allow_dca": await app.state.settings_db.get("allow_dca", "False") == "True",
+            "trade_limit": _safe_convert(float, await app.state.settings_db.get("trade_limit"), getattr(config, 'DEPO_USDT', 100.0)),
+            "leverage": _safe_convert(int, await app.state.settings_db.get("leverage"), getattr(config, 'LEVERAGE', 10)),
+            "tp_target": _safe_convert(float, await app.state.settings_db.get("tp_target"), 1.5),
             
             # --- ДОБАВЛЕН ЛИМИТ АКТИВНЫХ СДЕЛОК ---
-            "max_active_trades": _safe_convert(int, await settings_db_i.get("max_active_trades"), 3),
+            "max_active_trades": _safe_convert(int, await app.state.settings_db.get("max_active_trades"), 3),
             
-            "dca_0": _safe_convert(float, await settings_db_i.get("dca_0"), getattr(config, 'TRADE_PERCENT_1', 2.0)),
-            "dca_1": _safe_convert(float, await settings_db_i.get("dca_1"), getattr(config, 'TRADE_PERCENT_2', 4.0)),
-            "dca_2": _safe_convert(float, await settings_db_i.get("dca_2"), getattr(config, 'TRADE_PERCENT_4', 8.0)),
-            "dca_3": _safe_convert(float, await settings_db_i.get("dca_3"), getattr(config, 'TRADE_PERCENT_8', 16.0)),
+            "dca_0": _safe_convert(float, await app.state.settings_db.get("dca_0"), getattr(config, 'TRADE_PERCENT_1', 2.0)),
+            "dca_1": _safe_convert(float, await app.state.settings_db.get("dca_1"), getattr(config, 'TRADE_PERCENT_2', 4.0)),
+            "dca_2": _safe_convert(float, await app.state.settings_db.get("dca_2"), getattr(config, 'TRADE_PERCENT_4', 8.0)),
+            "dca_3": _safe_convert(float, await app.state.settings_db.get("dca_3"), getattr(config, 'TRADE_PERCENT_8', 16.0)),
             
-            "dca_level_1": _safe_convert(float, await settings_db_i.get("dca_level_1"), 3.5),
-            "dca_level_2": _safe_convert(float, await settings_db_i.get("dca_level_2"), 6.5),
-            "dca_level_3": _safe_convert(float, await settings_db_i.get("dca_level_3"), 14.5)
+            "dca_level_1": _safe_convert(float, await app.state.settings_db.get("dca_level_1"), 3.5),
+            "dca_level_2": _safe_convert(float, await app.state.settings_db.get("dca_level_2"), 6.5),
+            "dca_level_3": _safe_convert(float, await app.state.settings_db.get("dca_level_3"), 14.5)
         }
     except Exception as e:
         bot_logger.error(f"WEB: Ошибка в /api/settings: {e}")
@@ -78,21 +74,21 @@ async def get_settings() -> Dict[str, Any]:
 @app.post("/api/settings")
 async def update_settings(req: Request):
     data = await req.json()
-    if settings_db_i:
+    if app.state.settings_db:
         for key, value in data.items():
-            await settings_db_i.set(key, str(value))
+            await app.state.settings_db.set(key, str(value))
             
-        if exchange_i and "trade_limit" in data:
-            await exchange_i.update_limit(float(data["trade_limit"]))
+        if app.state.exchange and "trade_limit" in data:
+            await app.state.exchange.update_limit(float(data["trade_limit"]))
     return {"status": "ok"}
 
 
 @app.get("/api/coins")
 async def get_coins():
-    if not coins_db_i: 
+    if not app.state.coins: 
         return []
     try:
-        async with aiosqlite.connect(coins_db_i.db_name) as db:
+        async with aiosqlite.connect(app.state.coins.db_name) as db:
             cursor = await db.execute("SELECT coin, alias, is_active FROM coins")
             rows = await cursor.fetchall()
             return [{"coin": r[0], "alias": r[1], "is_active": bool(r[2])} for r in rows]
@@ -104,15 +100,15 @@ async def get_coins():
 @app.post("/api/coins")
 async def add_coin(req: Request):
     data = await req.json()
-    if coins_db_i and "coin" in data:
-        await coins_db_i.add_coin(data["coin"].upper(), data.get("alias", ""), 1)
+    if app.state.coins and "coin" in data:
+        await app.state.coins.add_coin(data["coin"].upper(), data.get("alias", ""), 1)
     return {"status": "ok"}
 
 
 @app.delete("/api/coins/{coin}")
 async def delete_coin(coin: str):
-    if coins_db_i:
-        async with aiosqlite.connect(coins_db_i.db_name) as db:
+    if app.state.coins:
+        async with aiosqlite.connect(app.state.coins.db_name) as db:
             await db.execute("DELETE FROM coins WHERE coin=?", (coin.upper(),))
             await db.commit()
     return {"status": "ok"}
@@ -121,9 +117,9 @@ async def delete_coin(coin: str):
 @app.put("/api/coins/{coin}")
 async def update_coin(coin: str, req: Request):
     data = await req.json()
-    if coins_db_i and "is_active" in data:
+    if app.state.coins and "is_active" in data:
         is_active = 1 if data["is_active"] else 0
-        async with aiosqlite.connect(coins_db_i.db_name) as db:
+        async with aiosqlite.connect(app.state.coins.db_name) as db:
             await db.execute("UPDATE coins SET is_active = ? WHERE coin = ?", (is_active, coin.upper()))
             await db.commit()
     return {"status": "ok"}
@@ -131,15 +127,15 @@ async def update_coin(coin: str, req: Request):
 
 @app.get("/api/data")
 async def get_data():
-    if not all([exchange_i, trades_db_i, settings_db_i, db_i]): 
+    if not all([app.state.exchange, app.state.trades_db, app.state.settings_db, app.state.db]): 
         return {}
     
-    limit = await settings_db_i.get("trade_limit", getattr(config, 'DEPO_USDT', 100.0))
+    limit = await app.state.settings_db.get("trade_limit", getattr(config, 'DEPO_USDT', 100.0))
     
     # ПАРАЛЛЕЛЬНЫЙ ЗАПРОС с получением Доступного Баланса
-    eq_task = asyncio.create_task(exchange_i.get_balance_info())
-    orders_task = asyncio.create_task(exchange_i.get_active_open_orders())
-    stats_task = asyncio.create_task(exchange_i.fetch_live_stats())
+    eq_task = asyncio.create_task(app.state.exchange.get_balance_info())
+    orders_task = asyncio.create_task(app.state.exchange.get_active_open_orders())
+    stats_task = asyncio.create_task(app.state.exchange.fetch_live_stats())
     
     await asyncio.gather(eq_task, orders_task, stats_task)
     
@@ -148,16 +144,16 @@ async def get_data():
 
     sigs = []
     try:
-        async with aiosqlite.connect(db_i.db_name) as db:
-            cursor = await db.execute("SELECT signal_type, coin, price, received_at FROM signals ORDER BY id DESC LIMIT 50")
+        async with aiosqlite.connect(app.state.db.db_name) as db:
+            cursor = await db.execute(f"SELECT signal_type, coin, price, received_at FROM signals ORDER BY id DESC LIMIT {config.SIGNALS_LIMIT}")
             raw_sigs = await cursor.fetchall()
             sigs = [{"type": s[0], "coin": s[1], "price": s[2], "time": s[3]} for s in raw_sigs]
     except Exception as e:
         bot_logger.error(f"WEB: Ошибка при загрузке сигналов: {e}")
 
     positions_data = {}
-    for coin, p in exchange_i.active_positions.items():
-        live = exchange_i.live_stats.get(coin, {})
+    for coin, p in app.state.exchange.active_positions.items():
+        live = app.state.exchange.live_stats.get(coin, {})
         gross = float(live.get("unrealisedPnl", 0.0))
         
         open_fee = p.get("open_fee", 0.0)
@@ -165,7 +161,7 @@ async def get_data():
         
         current_price = float(live.get("markPrice", p["avg_price"]))
 
-        trade = await trades_db_i.get_trading_trade(coin)
+        trade = await app.state.trades_db.get_trading_trade(coin)
         trade_dict = dict(trade) if trade else {}
         
         actual_tp = open_orders.get(coin, {}).get('tp')
@@ -176,7 +172,7 @@ async def get_data():
         tp_est_pnl = 0.0
         if target_p and p["avg_price"] > 0:
             est_gross = p["invested"] * (target_p / p["avg_price"] - 1)
-            tp_est_pnl = est_gross - open_fee - funding_fee - open_fee 
+            tp_est_pnl = est_gross - open_fee - funding_fee
             
         step = p["step"]
         dca_info = []
@@ -223,10 +219,10 @@ async def get_data():
 
 @app.get("/api/history")
 async def get_history():
-    if not trades_db_i: 
+    if not app.state.trades_db: 
         return {"history": [], "chart": [], "stats": {}}
         
-    raw = await trades_db_i.get_closed_trades()
+    raw = await app.state.trades_db.get_closed_trades()
     hist, chart = [], []
     total_net_pnl = 0.0
     
@@ -278,7 +274,7 @@ async def get_history():
 @app.post("/api/positions/{coin}/close")
 async def close_position_manual(coin: str):
     """Экстренное закрытие позиции по рынку (Вызывает инкапсулированный метод биржи)."""
-    if not exchange_i:
+    if not app.state.exchange:
         return {"status": "error", "message": "Контекст биржи не инициализирован"}
     
-    return await exchange_i.emergency_close_position(coin)
+    return await app.state.exchange.emergency_close_position(coin)

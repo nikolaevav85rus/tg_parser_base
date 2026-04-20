@@ -62,6 +62,7 @@ venv.bak/
 # Environments
 .env
 .env.*.local
+config/.env
 
 # Database folder
 db/
@@ -70,5 +71,10 @@ db/
 *.log
 logs/
 
+# Telegram sessions
 *.session
 *.session-journal
+
+# Large data files
+arc/*.csv
+arc/*.txt

@@ -3,6 +3,7 @@ from typing import Any, Optional
 import aiohttp
 
 import config
+
 from database import TradesDatabase, SettingsDatabase
 from logger import bot_logger
 
@@ -95,7 +96,7 @@ class Notifier:
                 except Exception as e:
                     bot_logger.debug(f"Ошибка при опросе обновлений бота: {e}")
                     
-                await asyncio.sleep(2)
+                await asyncio.sleep(config.NOTIFIER_POLL_INTERVAL)
 
     async def process_cmd(self, uid: int, text: str) -> None:
         """Асинхронная обработка входящих текстовых команд."""
@@ -112,24 +113,27 @@ class Notifier:
             )
             
         elif cmd == "/status":
-            # Вызовы биржи теперь асинхронные
             bybit_ok = await self.exchange_ref.check_connection() if self.exchange_ref else False
             tg_ok = self.tg_client.is_connected() if self.tg_client else False
-            
+
             bybit_status = "🟢 Подключено" if bybit_ok else "🔴 Ошибка (проверь сеть/API)"
             tg_status = "🟢 Подключено" if tg_ok else "🔴 Отключено"
-            
-            msg = f"📡 <b>Статус систем:</b>\nБиржа (Bybit): {bybit_status}\nТГ-Парсер: {tg_status}\n\n"
-            
-            # Вызов БД теперь асинхронный
+
+            eq = await self.exchange_ref.get_real_equity() if self.exchange_ref else 0.0
+            closed = await self.t_db.get_closed_trades()
+            pnl = sum((t['net_pnl'] or 0.0) for t in closed)
+
+            msg = (f"📡 <b>Статус систем:</b>\nБиржа (Bybit): {bybit_status}\nТГ-Парсер: {tg_status}\n\n"
+                   f"💰 <b>Баланс (Bybit):</b> ${eq:.2f}\n"
+                   f"📈 <b>Зафиксированный PNL:</b> ${pnl:.2f}\n\n")
+
             open_trades = await self.t_db.get_open_trades()
-            if not open_trades: 
+            if not open_trades:
                 msg += "🟢 Нет открытых позиций."
                 return await self.reply_to_user(uid, msg)
-            
+
             msg += "📊 <b>Активные позиции:</b>\n\n"
             for t in open_trades:
-                # Используем безопасный доступ по ключам благодаря aiosqlite.Row
                 msg += (f"🔸 <b>{t['coin']}</b> (Шаг {t['step']})\n"
                         f"Вложено: ${t['total_inv']:.2f} | Ср.цена: {t['avg_p']:.4f}\n\n")
             await self.reply_to_user(uid, msg)
