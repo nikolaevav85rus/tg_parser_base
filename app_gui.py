@@ -2,6 +2,7 @@ import sys
 import os
 import asyncio
 import logging
+import webbrowser
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -104,11 +105,12 @@ class MainWindow(QMainWindow):
         bar.addWidget(self._lbl_status)
         bar.addStretch()
 
-        self._btn_start   = QPushButton("▶  Старт")
-        self._btn_stop    = QPushButton("■  Стоп")
-        self._btn_restart = QPushButton("↺  Перезапуск")
+        self._btn_start     = QPushButton("▶  Старт")
+        self._btn_stop      = QPushButton("■  Стоп")
+        self._btn_restart   = QPushButton("↺  Перезапуск")
+        self._btn_dashboard = QPushButton("🌐  Дашборд")
 
-        for btn in (self._btn_start, self._btn_stop, self._btn_restart):
+        for btn in (self._btn_start, self._btn_stop, self._btn_restart, self._btn_dashboard):
             btn.setFixedHeight(30)
             btn.setMinimumWidth(110)
             bar.addWidget(btn)
@@ -116,6 +118,7 @@ class MainWindow(QMainWindow):
         self._btn_start.clicked.connect(self.start_bot)
         self._btn_stop.clicked.connect(self.stop_bot)
         self._btn_restart.clicked.connect(self.restart_bot)
+        self._btn_dashboard.clicked.connect(self.open_dashboard)
         layout.addLayout(bar)
 
         # Лог
@@ -140,6 +143,8 @@ class MainWindow(QMainWindow):
         self._tray_start   = menu.addAction("▶  Старт")
         self._tray_stop    = menu.addAction("■  Стоп")
         self._tray_restart = menu.addAction("↺  Перезапуск")
+        menu.addSeparator()
+        menu.addAction("🌐  Открыть дашборд").triggered.connect(self.open_dashboard)
         menu.addSeparator()
         menu.addAction("Показать / Скрыть").triggered.connect(self._toggle_window)
         menu.addSeparator()
@@ -206,6 +211,10 @@ class MainWindow(QMainWindow):
             self.stop_bot()
         else:
             self.start_bot()
+
+    def open_dashboard(self) -> None:
+        import config
+        webbrowser.open(f"http://{config.WEB_HOST}:{config.WEB_PORT}")
 
     def _on_started(self) -> None:
         self._running = True
