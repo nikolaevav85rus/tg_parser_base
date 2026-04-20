@@ -7,3 +7,4 @@ python-dotenv==1.2.2
 aiohttp==3.13.3
 aiosqlite==0.22.1
 aiofiles==25.1.0
+PyQt6==6.11.0

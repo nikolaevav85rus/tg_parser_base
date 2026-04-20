@@ -89,6 +89,20 @@ def setup_raw_logger() -> logging.Logger:
     return logger
 
 
+class QtLogHandler(logging.Handler):
+    """Перенаправляет записи логгера в GUI через callable (thread-safe через Qt signals)."""
+
+    def __init__(self, emit_func):
+        super().__init__()
+        self._emit_func = emit_func
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._emit_func(record.levelno, self.format(record))
+        except Exception:
+            pass
+
+
 # Глобальные инстансы логгеров для импорта в другие модули
 bot_logger = setup_logger()
 raw_logger = setup_raw_logger()
