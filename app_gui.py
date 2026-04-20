@@ -1,4 +1,5 @@
 import sys
+import os
 import asyncio
 import logging
 
@@ -8,6 +9,24 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QTextCursor
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_icon() -> QIcon:
+    path = os.path.join(_BASE_DIR, "icon.png")
+    if os.path.exists(path):
+        return QIcon(path)
+    # fallback — зелёный круг
+    px = QPixmap(64, 64)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setBrush(QColor("#2ecc71"))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawEllipse(6, 6, 52, 52)
+    p.end()
+    return QIcon(px)
 
 from logger import bot_logger, GMT3Formatter, QtLogHandler
 from main import TradingBot
@@ -49,18 +68,6 @@ class BotWorker(QThread):
             task.cancel()
 
 
-def _make_icon(color: str, size: int = 64) -> QIcon:
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pixmap)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(color))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.drawEllipse(6, 6, size - 12, size - 12)
-    p.end()
-    return QIcon(pixmap)
-
-
 class MainWindow(QMainWindow):
     _log_signal = pyqtSignal(int, str)
 
@@ -70,8 +77,7 @@ class MainWindow(QMainWindow):
         self._running = False
         self._pending_restart = False
 
-        self._icon_green = _make_icon("#2ecc71")
-        self._icon_red = _make_icon("#e74c3c")
+        self._icon = _load_icon()
 
         self._build_ui()
         self._build_tray()
@@ -124,7 +130,7 @@ class MainWindow(QMainWindow):
         self._log_signal.connect(self._append_log)
 
     def _build_tray(self) -> None:
-        self._tray = QSystemTrayIcon(self._icon_red, self)
+        self._tray = QSystemTrayIcon(self._icon, self)
         self._tray.setToolTip("TG Parser — Остановлен")
 
         menu = QMenu()
@@ -216,16 +222,15 @@ class MainWindow(QMainWindow):
 
     def _set_state(self, running: bool) -> None:
         if running:
-            text, color, icon, tip = "● Работает", "#2ecc71", self._icon_green, "TG Parser — Работает"
+            text, color, tip = "● Работает", "#2ecc71", "TG Parser — Работает"
         else:
-            text, color, icon, tip = "● Остановлен", "#e74c3c", self._icon_red, "TG Parser — Остановлен"
+            text, color, tip = "● Остановлен", "#e74c3c", "TG Parser — Остановлен"
 
         self._lbl_status.setText(text)
         self._lbl_status.setStyleSheet(f"color:{color};")
-        self._tray.setIcon(icon)
         self._tray.setToolTip(tip)
         self._tray_status.setText(text)
-        self.setWindowIcon(icon)
+        self.setWindowIcon(self._icon)
 
         self._btn_start.setEnabled(not running)
         self._btn_stop.setEnabled(running)
