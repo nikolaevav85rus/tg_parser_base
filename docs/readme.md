@@ -251,14 +251,14 @@ TP:  средняя_цена × 1.015
 
 ```env
 # Telegram Парсер
-TG_API_ID=12345678
-TG_API_HASH=abcdef1234567890abcdef1234567890
-TG_TARGET_CHANNEL=-1001234567890   # ID канала или @alias
+TG_API_ID=-
+TG_API_HASH=-
+TG_TARGET_CHANNEL=--   # ID канала или @alias
 SESSION_NAME=session_settings       # имя файла сессии
 
 # Уведомления
-TG_NOTIFIER_TOKEN=1234567890:AAbbccdd...
-ALLOWED_USERS=123456789,987654321   # ID пользователей через запятую
+TG_NOTIFIER_TOKEN=-
+ALLOWED_USERS=-,-   # ID пользователей через запятую
 
 # Bybit
 BYBIT_API_KEY=your_api_key
