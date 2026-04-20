@@ -126,7 +126,7 @@ class TradingBot:
             events.NewMessage(chats=config.TARGET_CHANNEL)
         )
 
-        uvicorn_config = uvicorn.Config(app, host=config.WEB_HOST, port=config.WEB_PORT, log_level="warning")
+        uvicorn_config = uvicorn.Config(app, host=config.WEB_HOST, port=config.WEB_PORT, log_level="warning", log_config=None)
         server = uvicorn.Server(uvicorn_config)
         
         bot_logger.info("🚀 Запуск всех систем бота...")
