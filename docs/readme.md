@@ -300,12 +300,47 @@ python utils/auth_me.py
 
 # 6. Наполнить базу монет
 python utils/fill_coins.py
-
-# 7. Запустить бота
-python main.py
 ```
 
+### Способы запуска
+
+| Способ | Команда / Действие | Примечание |
+|---|---|---|
+| **GUI (рекомендуется)** | Двойной клик на `start.bat` | Нет терминала, трей, лог, авто-рестарт |
+| Ярлык на рабочем столе | `TG Parser.lnk` | Создаётся один раз, см. ниже |
+| Терминал с venv | `python app_gui.py` | Для разработки |
+| Только бот (без GUI) | `python main.py` | Как раньше, через терминал |
+
 **Дашборд:** http://127.0.0.1:8000
+
+---
+
+## Сборка standalone .exe (PyInstaller)
+
+Позволяет запустить приложение на ПК без установки Python и зависимостей.
+
+```bash
+# 1. Установить PyInstaller (один раз)
+pip install pyinstaller
+
+# 2. Собрать
+pyinstaller tg_parser.spec
+
+# Результат: dist/TgParserBot.exe
+```
+
+**Что нужно положить рядом с .exe перед запуском:**
+```
+dist/
+├── TgParserBot.exe
+├── config/
+│   └── .env              ← конфигурация (не упакована в exe)
+└── db/                   ← базы данных (создаются автоматически)
+```
+
+> `templates/` и `icon.png` упакованы внутрь `.exe` через `tg_parser.spec`.  
+> При обновлении кода — пересобрать: `pyinstaller tg_parser.spec`.  
+> При добавлении новых зависимостей — добавить их в `hiddenimports` в `tg_parser.spec`.
 
 ---
 
@@ -315,19 +350,29 @@ python main.py
 tg_parser/
 ├── config/                 # Конфигурация и сессия Telegram
 │   └── .env
-├── db/                     # SQLite базы данных
+├── database/               # Пакет слоя данных
+│   ├── base.py             # BaseDatabase (общий connect)
+│   ├── signals.py          # Database — принятые сигналы
+│   ├── trades.py           # TradesDatabase — позиции
+│   ├── settings.py         # SettingsDatabase — параметры бота
+│   └── coins.py            # CoinsDatabase — вайтлист монет
+├── db/                     # SQLite файлы (авто-создание)
 ├── docs/                   # Документация
 ├── logs/                   # Лог-файлы (авто-создание)
 ├── templates/              # HTML шаблон дашборда
-├── utils/                  # Утилиты: авторизация, тесты, экспорт
-├── arc/                    # Архивный код (не используется)
-├── main.py                 # Точка входа
+├── utils/                  # Утилиты: авторизация, экспорт
+├── arc/                    # Архивные CSV-данные
+├── app_gui.py              # GUI-приложение (рекомендуемый запуск)
+├── main.py                 # TradingBot — оркестратор
 ├── bybit_exchange.py       # Торговый движок
 ├── parser.py               # Парсер сигналов
-├── database.py             # Слой данных
 ├── notifier.py             # Telegram-уведомления
-├── web_server.py           # Веб-дашборд
+├── web_server.py           # Веб-дашборд (FastAPI)
 ├── config.py               # Загрузка конфигурации
 ├── logger.py               # Настройка логирования
+├── start.bat               # Запуск GUI без терминала (Windows)
+├── run.pyw                 # Альтернативный запуск (pythonw)
+├── tg_parser.spec          # PyInstaller spec для сборки .exe
+├── icon.png / icon.ico     # Иконка приложения
 └── requirements.txt
 ```
