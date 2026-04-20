@@ -27,6 +27,25 @@ class CoinsDatabase(BaseDatabase):
             )
             await db.commit()
 
+    async def get_all(self) -> list:
+        async with self._connect() as db:
+            cursor = await db.execute("SELECT coin, alias, is_active FROM coins")
+            rows = await cursor.fetchall()
+            return [{"coin": r[0], "alias": r[1], "is_active": bool(r[2])} for r in rows]
+
+    async def delete(self, coin: str) -> None:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM coins WHERE coin=?", (coin.upper(),))
+            await db.commit()
+
+    async def set_active(self, coin: str, is_active: bool) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE coins SET is_active = ? WHERE coin = ?",
+                (1 if is_active else 0, coin.upper())
+            )
+            await db.commit()
+
     async def get_coin(self, coin: str) -> Optional[Dict[str, Any]]:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row

@@ -85,13 +85,10 @@ async def update_settings(req: Request):
 
 @app.get("/api/coins")
 async def get_coins():
-    if not app.state.coins: 
+    if not app.state.coins:
         return []
     try:
-        async with aiosqlite.connect(app.state.coins.db_name) as db:
-            cursor = await db.execute("SELECT coin, alias, is_active FROM coins")
-            rows = await cursor.fetchall()
-            return [{"coin": r[0], "alias": r[1], "is_active": bool(r[2])} for r in rows]
+        return await app.state.coins.get_all()
     except Exception as e:
         bot_logger.error(f"WEB: Ошибка в /api/coins: {e}")
         return []
@@ -108,9 +105,7 @@ async def add_coin(req: Request):
 @app.delete("/api/coins/{coin}")
 async def delete_coin(coin: str):
     if app.state.coins:
-        async with aiosqlite.connect(app.state.coins.db_name) as db:
-            await db.execute("DELETE FROM coins WHERE coin=?", (coin.upper(),))
-            await db.commit()
+        await app.state.coins.delete(coin)
     return {"status": "ok"}
 
 
@@ -118,10 +113,7 @@ async def delete_coin(coin: str):
 async def update_coin(coin: str, req: Request):
     data = await req.json()
     if app.state.coins and "is_active" in data:
-        is_active = 1 if data["is_active"] else 0
-        async with aiosqlite.connect(app.state.coins.db_name) as db:
-            await db.execute("UPDATE coins SET is_active = ? WHERE coin = ?", (is_active, coin.upper()))
-            await db.commit()
+        await app.state.coins.set_active(coin, bool(data["is_active"]))
     return {"status": "ok"}
 
 

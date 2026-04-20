@@ -6,7 +6,11 @@
 
 import math
 import asyncio
+from datetime import datetime
 from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, Set
+
+# Время последнего успешного ответа биржи — читается из GUI-потока (GIL-safe)
+last_api_ok: Optional[datetime] = None
 
 from pybit.unified_trading import HTTP
 import aiosqlite
@@ -79,7 +83,9 @@ class BybitExchange:
             if isinstance(res, dict) and res.get('retCode') != 0:
                 bot_logger.error(f"API Ошибка: {res.get('retMsg')} (Код: {res.get('retCode')})")
                 return res  # type: ignore
-            # Успешный вызов — сбрасываем счётчик и уведомляем о восстановлении
+            # Успешный вызов — фиксируем время и сбрасываем счётчик
+            import bybit_exchange as _self_mod
+            _self_mod.last_api_ok = datetime.now()
             if self._api_disconnected:
                 self._api_disconnected = False
                 bot_logger.info("✅ Связь с биржей восстановлена.")

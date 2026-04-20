@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QSystemTrayIcon, QMenu,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QTextCursor
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
         self._worker: BotWorker | None = None
         self._running = False
         self._pending_restart = False
+        self._user_stop_requested = False
 
         self._icon = _load_icon()
 
@@ -84,6 +85,11 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._install_log_handler()
         self._set_state(False)
+
+        # G2: таймер обновления времени последнего ответа биржи
+        self._api_timer = QTimer(self)
+        self._api_timer.timeout.connect(self._update_api_label)
+        self._api_timer.start(5000)
 
     # ------------------------------------------------------------------ UI
 
@@ -121,7 +127,21 @@ class MainWindow(QMainWindow):
         self._btn_dashboard.clicked.connect(self.open_dashboard)
         layout.addLayout(bar)
 
-        # Лог
+        # G2: строка состояния биржи
+        self._lbl_api = QLabel("Биржа: нет данных")
+        self._lbl_api.setStyleSheet("color:#666; font-size:10px;")
+        layout.addWidget(self._lbl_api)
+
+        # Лог + кнопка очистки (G1)
+        log_header = QHBoxLayout()
+        log_header.addStretch()
+        btn_clear = QPushButton("Очистить лог")
+        btn_clear.setFixedHeight(22)
+        btn_clear.setStyleSheet("font-size:10px;")
+        btn_clear.clicked.connect(self._log_clear)
+        log_header.addWidget(btn_clear)
+        layout.addLayout(log_header)
+
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFont(QFont("Consolas", 9))
@@ -145,6 +165,11 @@ class MainWindow(QMainWindow):
         self._tray_restart = menu.addAction("↺  Перезапуск")
         menu.addSeparator()
         menu.addAction("🌐  Открыть дашборд").triggered.connect(self.open_dashboard)
+        menu.addSeparator()
+        self._tray_autostart = menu.addAction("🚀  Запускать при старте Windows")
+        self._tray_autostart.setCheckable(True)
+        self._tray_autostart.setChecked(self._autostart_enabled())
+        self._tray_autostart.triggered.connect(self._toggle_autostart)
         menu.addSeparator()
         menu.addAction("Показать / Скрыть").triggered.connect(self._toggle_window)
         menu.addSeparator()
@@ -175,6 +200,22 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ Лог
 
+    def _log_clear(self) -> None:
+        self._log.clear()
+
+    def _update_api_label(self) -> None:
+        try:
+            import bybit_exchange
+            t = bybit_exchange.last_api_ok
+            if t:
+                self._lbl_api.setText(f"Биржа: последний ответ {t.strftime('%H:%M:%S')}")
+                self._lbl_api.setStyleSheet("color:#2ecc71; font-size:10px;")
+            else:
+                self._lbl_api.setText("Биржа: нет данных")
+                self._lbl_api.setStyleSheet("color:#666; font-size:10px;")
+        except Exception:
+            pass
+
     def _append_log(self, level: int, msg: str) -> None:
         if level >= logging.ERROR:
             color = "#e74c3c"
@@ -191,6 +232,7 @@ class MainWindow(QMainWindow):
     def start_bot(self) -> None:
         if self._running:
             return
+        self._user_stop_requested = False
         self._worker = BotWorker()
         self._worker.started_signal.connect(self._on_started)
         self._worker.stopped_signal.connect(self._on_stopped)
@@ -201,6 +243,7 @@ class MainWindow(QMainWindow):
 
     def stop_bot(self) -> None:
         if self._worker:
+            self._user_stop_requested = True
             self._btn_stop.setEnabled(False)
             self._btn_restart.setEnabled(False)
             self._worker.request_stop()
@@ -216,6 +259,40 @@ class MainWindow(QMainWindow):
         import config
         webbrowser.open(f"http://{config.WEB_HOST}:{config.WEB_PORT}")
 
+    # ------------------------------------------------------------------ Автозагрузка (I2)
+
+    _AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _AUTOSTART_NAME = "TgParserBot"
+
+    def _autostart_cmd(self) -> str:
+        pythonw = os.path.join(_BASE_DIR, "venv", "Scripts", "pythonw.exe")
+        script = os.path.join(_BASE_DIR, "app_gui.py")
+        return f'"{pythonw}" "{script}"'
+
+    def _autostart_enabled(self) -> bool:
+        if sys.platform != "win32":
+            return False
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._AUTOSTART_KEY) as k:
+                winreg.QueryValueEx(k, self._AUTOSTART_NAME)
+                return True
+        except FileNotFoundError:
+            return False
+
+    def _toggle_autostart(self, checked: bool) -> None:
+        if sys.platform != "win32":
+            return
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if checked:
+                winreg.SetValueEx(k, self._AUTOSTART_NAME, 0, winreg.REG_SZ, self._autostart_cmd())
+            else:
+                try:
+                    winreg.DeleteValue(k, self._AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+
     def _on_started(self) -> None:
         self._running = True
         self._set_state(True)
@@ -226,6 +303,9 @@ class MainWindow(QMainWindow):
         if self._pending_restart:
             self._pending_restart = False
             self.start_bot()
+        elif not self._user_stop_requested:
+            bot_logger.warning("⚠️ Бот остановился неожиданно. Автоперезапуск через 5 секунд...")
+            QTimer.singleShot(5000, self.start_bot)
 
     # ------------------------------------------------------------------ Состояние UI
 
