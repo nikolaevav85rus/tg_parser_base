@@ -6,13 +6,17 @@
 
 import math
 import asyncio
-from typing import Dict, Any, Tuple, Optional, Set
+from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, Set
 
 from pybit.unified_trading import HTTP
+import aiosqlite
 
 import config
 from database import TradesDatabase, SettingsDatabase, CoinsDatabase
 from logger import bot_logger
+
+if TYPE_CHECKING:
+    from notifier import Notifier
 
 
 class BybitExchange:
@@ -21,10 +25,7 @@ class BybitExchange:
     Управляет торговым циклом, кэшированием данных и мониторингом ордеров.
     """
     
-    def __init__(self, initial_limit: float, trades_db: TradesDatabase, settings_db: SettingsDatabase, coins_db: CoinsDatabase, notifier: Any) -> None:
-        """
-        Инициализация биржевого клиента и локальных кэшей.
-        """
+    def __init__(self, initial_limit: float, trades_db: TradesDatabase, settings_db: SettingsDatabase, coins_db: CoinsDatabase, notifier: "Notifier") -> None:
         self.db = trades_db
         self.settings = settings_db
         self.coins_db = coins_db
@@ -299,7 +300,7 @@ class BybitExchange:
             except Exception as e:
                 bot_logger.error(f"Ошибка мониторинга: {e}")
 
-    async def _process_trade_fills(self, trade: Any) -> None:
+    async def _process_trade_fills(self, trade: aiosqlite.Row) -> None:
         coin = trade["coin"]
         open_order_ids = await self._get_open_order_ids(coin)
 
@@ -310,7 +311,7 @@ class BybitExchange:
         if trade["dca_order_id"] and trade["dca_order_id"] not in open_order_ids:
             await self._process_dca_execution(trade, coin)
 
-    async def _process_tp_execution(self, trade: Any, coin: str) -> None:
+    async def _process_tp_execution(self, trade: aiosqlite.Row, coin: str) -> None:
         res_p, _, fee = await self._get_real_execution_data(trade["tp_order_id"], coin)
         if res_p:
             _, _, net_pnl = await self.db.close_trade(coin, res_p, fee)
@@ -320,7 +321,7 @@ class BybitExchange:
             await self.notifier.send(f"✅ <b>TP: {coin}</b>\nЦена: {res_p}\nNet PNL: <b>{net_pnl:.2f}$</b>")
             await self.load_active_positions()
 
-    async def _process_dca_execution(self, trade: Any, coin: str) -> None:
+    async def _process_dca_execution(self, trade: aiosqlite.Row, coin: str) -> None:
         filled_p, filled_inv, fee = await self._get_real_execution_data(trade["dca_order_id"], coin)
         if not filled_p: 
             return

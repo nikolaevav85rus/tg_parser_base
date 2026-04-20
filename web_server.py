@@ -151,18 +151,20 @@ async def get_data():
     except Exception as e:
         bot_logger.error(f"WEB: Ошибка при загрузке сигналов: {e}")
 
+    all_trades = await app.state.trades_db.get_open_trades()
+    trades_by_coin = {t['coin']: dict(t) for t in all_trades}
+
     positions_data = {}
     for coin, p in app.state.exchange.active_positions.items():
         live = app.state.exchange.live_stats.get(coin, {})
         gross = float(live.get("unrealisedPnl", 0.0))
-        
+
         open_fee = p.get("open_fee", 0.0)
         funding_fee = p.get("funding_fee", 0.0)
-        
+
         current_price = float(live.get("markPrice", p["avg_price"]))
 
-        trade = await app.state.trades_db.get_trading_trade(coin)
-        trade_dict = dict(trade) if trade else {}
+        trade_dict = trades_by_coin.get(coin, {})
         
         actual_tp = open_orders.get(coin, {}).get('tp')
         actual_dca = open_orders.get(coin, {}).get('dca')
