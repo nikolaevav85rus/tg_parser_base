@@ -129,7 +129,7 @@ class MainWindow(QMainWindow):
 
         # G2: строка состояния биржи
         self._lbl_api = QLabel("Биржа: нет данных")
-        self._lbl_api.setStyleSheet("color:#666; font-size:10px;")
+        self._lbl_api.setStyleSheet("color:#666; font-size:12px;")
         layout.addWidget(self._lbl_api)
 
         # Лог + кнопка очистки (G1)
@@ -209,10 +209,10 @@ class MainWindow(QMainWindow):
             t = bybit_exchange.last_api_ok
             if t:
                 self._lbl_api.setText(f"Биржа: последний ответ {t.strftime('%H:%M:%S')}")
-                self._lbl_api.setStyleSheet("color:#2ecc71; font-size:10px;")
+                self._lbl_api.setStyleSheet("color:#2ecc71; font-size:12px;")
             else:
                 self._lbl_api.setText("Биржа: нет данных")
-                self._lbl_api.setStyleSheet("color:#666; font-size:10px;")
+                self._lbl_api.setStyleSheet("color:#666; font-size:12px;")
         except Exception:
             pass
 
