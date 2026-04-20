@@ -109,3 +109,20 @@ EXEC_DATA_DELAY: float = _get_float("EXEC_DATA_DELAY", 1.2)
 DCA_MAX_STEPS: int = _get_int("DCA_MAX_STEPS", 3)
 SIGNALS_LIMIT: int = _get_int("SIGNALS_LIMIT", 50)
 NOTIFIER_POLL_INTERVAL: int = _get_int("NOTIFIER_POLL_INTERVAL", 2)
+
+
+def _validate() -> None:
+    errors = []
+    if not API_HASH:
+        errors.append("TG_API_HASH")
+    if not BYBIT_API_KEY:
+        errors.append("BYBIT_API_KEY")
+    if not BYBIT_API_SECRET:
+        errors.append("BYBIT_API_SECRET")
+    if DEPO_USDT <= 0:
+        errors.append("DEPO_USDT (должен быть > 0)")
+    if errors:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не заданы обязательные параметры: {', '.join(errors)}")
+        sys.exit(1)
+
+_validate()
