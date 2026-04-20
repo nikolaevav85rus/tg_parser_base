@@ -281,6 +281,11 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    # Отдельный AppID — Windows показывает нашу иконку вместо Python
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("tg_parser.bot.gui")
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
