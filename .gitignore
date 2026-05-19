@@ -77,3 +77,10 @@ logs/
 # Large data files
 arc/*.csv
 arc/*.txt
+arc/*.md
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# Backup files
+*.bak
