@@ -22,7 +22,7 @@ class TradesDatabase(BaseDatabase):
                     coin TEXT, step INTEGER, buy_p REAL, buy_a REAL,
                     dca1_p REAL, dca1_a REAL, dca2_p REAL, dca2_a REAL, dca3_p REAL, dca3_a REAL,
                     avg_p REAL, total_inv REAL, target_p REAL, created_at TEXT,
-                    exit_p REAL, pnl REAL, pnl_p REAL
+                    exit_p REAL, pnl REAL, pnl_p REAL, closed_at TEXT
                 )
             ''')
             await db.execute(
@@ -46,6 +46,9 @@ class TradesDatabase(BaseDatabase):
                 ("tp_order_id",  "TEXT"),
                 ("dca_order_id", "TEXT"),
                 ("status",       "TEXT DEFAULT 'TRADING'"),
+            ],
+            2: [
+                ("closed_at",    "TEXT"),
             ]
         }
 
@@ -61,6 +64,13 @@ class TradesDatabase(BaseDatabase):
                         bot_logger.info(f"БД миграция v{version}: добавлена колонка {col_name}")
                     except Exception:
                         pass  # колонка уже существует
+
+                if version >= 2:
+                    await db.execute(
+                        "UPDATE trades SET closed_at = created_at "
+                        "WHERE status = 'closed' AND (closed_at IS NULL OR closed_at = '')"
+                    )
+
                 await db.execute(
                     "INSERT OR REPLACE INTO schema_version (version) VALUES (?)", (version,)
                 )
@@ -155,11 +165,12 @@ class TradesDatabase(BaseDatabase):
             gross_pnl = (qty * exit_price) - inv
             gross_pnl_p = (gross_pnl / inv * 100) if inv > 0 else 0
             net_pnl = gross_pnl - open_fee - close_fee - funding_fee
+            closed_at = datetime.now(timezone.utc).isoformat()
 
             await db.execute(
                 '''UPDATE trades SET status='closed', exit_p=?, pnl=?, pnl_p=?,
-                close_fee=?, funding_fee=?, net_pnl=? WHERE coin=? AND status='TRADING' ''',
-                (exit_price, gross_pnl, gross_pnl_p, close_fee, funding_fee, net_pnl, coin)
+                close_fee=?, funding_fee=?, net_pnl=?, closed_at=? WHERE coin=? AND status='TRADING' ''',
+                (exit_price, gross_pnl, gross_pnl_p, close_fee, funding_fee, net_pnl, closed_at, coin)
             )
             await db.commit()
             return gross_pnl, gross_pnl_p, net_pnl
@@ -175,5 +186,8 @@ class TradesDatabase(BaseDatabase):
     async def get_closed_trades(self) -> List[aiosqlite.Row]:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM trades WHERE status='closed'")
+            cursor = await db.execute(
+                "SELECT * FROM trades WHERE status='closed' "
+                "ORDER BY COALESCE(closed_at, created_at) ASC"
+            )
             return await cursor.fetchall()

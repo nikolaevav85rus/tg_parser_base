@@ -13,6 +13,16 @@ from logger import bot_logger
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
+
+def _init_empty_context() -> None:
+    """Инициализация пустого web-контекста для прямого импорта FastAPI app."""
+    app.state.db = None
+    app.state.exchange = None
+    app.state.trades_db = None
+    app.state.settings_db = None
+    app.state.coins = None
+
+
 def set_context(d: Any, e: Any, t: Any, s: Any, c: Any) -> None:
     """Установка контекста баз данных и биржи через app.state."""
     app.state.db = d
@@ -20,6 +30,9 @@ def set_context(d: Any, e: Any, t: Any, s: Any, c: Any) -> None:
     app.state.trades_db = t
     app.state.settings_db = s
     app.state.coins = c
+
+
+_init_empty_context()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -40,6 +53,19 @@ def _safe_convert(func: Any, value: Any, default: Any) -> Any:
         return func(value)
     except (ValueError, TypeError): 
         return default
+
+
+def _parse_trade_datetime(value: Any) -> datetime | None:
+    """Парсинг даты сделки из ISO-строки с безопасным fallback."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 @app.get("/api/settings")
@@ -228,23 +254,19 @@ async def get_history():
         net = t['net_pnl'] if t['net_pnl'] is not None else gross
         total_net_pnl += net
         stats["total"] += net
+        closed_at_raw = t['closed_at'] or t['created_at']
+        closed_dt = _parse_trade_datetime(closed_at_raw)
         
-        try:
-            created_str = t['created_at'].replace('Z', '+00:00')
-            dt = datetime.fromisoformat(created_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-                
-            delta = now - dt
+        if closed_dt:
+            delta = now - closed_dt
             if delta <= timedelta(days=1): stats["1d"] += net
             if delta <= timedelta(days=7): stats["7d"] += net
             if delta <= timedelta(days=30): stats["30d"] += net
             if delta <= timedelta(days=365): stats["365d"] += net
-        except Exception:
-            pass
         
         hist.append({
-            "time": t['created_at'], 
+            "time": closed_at_raw,
+            "opened_at": t['created_at'],
             "symbol": t['coin'], 
             "buy_p": t['buy_p'], 
             "avg": t['avg_p'], 
@@ -257,7 +279,7 @@ async def get_history():
             "close_fee": round(t['close_fee'] or 0.0, 4), 
             "net_pnl": round(net, 2)
         })
-        chart.append({"time": t['created_at'], "total": round(total_net_pnl, 2)})
+        chart.append({"time": closed_at_raw, "total": round(total_net_pnl, 2)})
         
     for k in stats:
         stats[k] = round(stats[k], 2)
