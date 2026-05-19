@@ -243,7 +243,11 @@ function updateHistory() {
                 <td>${formatPrice(t.avg)}</td><td>${formatPrice(t.exit)}</td>
                 <td>$${t.total_inv.toFixed(1)}</td>
                 <td class="${gClass}">$${t.gross_pnl.toFixed(2)}<br><small>${t.pnl_p}%</small></td>
-                <td class="fees-text">-$${(t.open_fee+t.fund_fee+t.close_fee).toFixed(3)}</td>
+                <td class="fees-text" style="font-size:0.78rem; line-height:1.3;">
+                    O: -$${t.open_fee.toFixed(3)}<br>
+                    F: -$${t.fund_fee.toFixed(3)}<br>
+                    C: -$${t.close_fee.toFixed(3)}
+                </td>
                 <td class="${nClass}"><strong>${t.net_pnl>=0?'+':''}$${t.net_pnl.toFixed(2)}</strong></td>
             </tr>`;
         });
