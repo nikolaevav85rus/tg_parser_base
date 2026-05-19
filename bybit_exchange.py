@@ -6,7 +6,7 @@
 
 import math
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, Set
 
 # Время последнего успешного ответа биржи — читается из GUI-потока (GIL-safe)
@@ -221,9 +221,57 @@ class BybitExchange:
             q = sum(float(e['execQty']) for e in ex)
             v = sum(float(e['execValue']) for e in ex)
             f = sum(float(e['execFee']) for e in ex)
-            if q > 0: 
+            if q > 0:
                 return v / q, v, f
         return None, None, 0.0
+
+    async def _fetch_funding_fee(self, symbol: str, since_iso: str) -> float:
+        """
+        Сумма фандинга по символу за период от since_iso до now.
+        Возвращает положительное число = расход (списано со счёта).
+        Запрашивает get_transaction_log type=SETTLEMENT с пагинацией.
+        """
+        try:
+            dt = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            start_ms = int(dt.timestamp() * 1000)
+            end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        except Exception as e:
+            bot_logger.warning(f"EXCHANGE: Не удалось распарсить created_at='{since_iso}' для {symbol}: {e}")
+            return 0.0
+
+        total = 0.0
+        cursor: Optional[str] = None
+        for _ in range(10):  # safety: max 500 записей
+            params: Dict[str, Any] = {
+                "accountType": "UNIFIED",
+                "category": "linear",
+                "currency": "USDT",
+                "type": "SETTLEMENT",
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": 50,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            res = await self._api_call(self.session.get_transaction_log, **params)
+            if res.get('retCode') != 0:
+                break
+            result = res.get('result', {}) or {}
+            items = result.get('list', []) or []
+            for it in items:
+                if it.get('symbol') == symbol:
+                    try:
+                        total += float(it.get('funding', 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+            cursor = result.get('nextPageCursor') or None
+            if not cursor or len(items) < 50:
+                break
+
+        # API возвращает отрицательное значение при списании — переводим в положительный расход
+        return -total
 
     async def execute_signal(self, coin: str, signal_type: str, signal_price: float, target_price: float) -> None:
         bot_logger.info(f"⚡ ТОРГОВЫЙ МОДУЛЬ: Получена команда {signal_type} для {coin}")
@@ -335,10 +383,11 @@ class BybitExchange:
     async def _process_tp_execution(self, trade: aiosqlite.Row, coin: str) -> None:
         res_p, _, fee = await self._get_real_execution_data(trade["tp_order_id"], coin)
         if res_p:
-            _, _, net_pnl = await self.db.close_trade(coin, res_p, fee)
+            funding_fee = await self._fetch_funding_fee(coin, trade["created_at"])
+            _, _, net_pnl = await self.db.close_trade(coin, res_p, fee, funding_fee)
             await self._cancel_order_safe(coin, trade["dca_order_id"])
-            
-            bot_logger.info(f"✅ TP Исполнен {coin}. PNL: ${net_pnl:.2f}")
+
+            bot_logger.info(f"✅ TP Исполнен {coin}. PNL: ${net_pnl:.2f} (funding: ${funding_fee:.4f})")
             await self.notifier.send(f"✅ <b>TP: {coin}</b>\nЦена: {res_p}\nNet PNL: <b>{net_pnl:.2f}$</b>")
             await self.load_active_positions()
 
@@ -450,9 +499,14 @@ class BybitExchange:
                     )
                     
                     if close_order.get('retCode') == 0:
-                        _, _, net = await self.db.close_trade(coin, current_price)
+                        close_order_id = close_order['result']['orderId']
+                        real_exit, _, close_fee = await self._get_real_execution_data(close_order_id, coin)
+                        exit_price = real_exit or current_price
+                        funding_fee = await self._fetch_funding_fee(coin, trade["created_at"])
+
+                        _, _, net = await self.db.close_trade(coin, exit_price, close_fee, funding_fee)
                         await self.load_active_positions()
-                        bot_logger.info(f"🚨 Экстренное закрытие {coin} через WebUI выполнено. PNL: {net:.2f}")
+                        bot_logger.info(f"🚨 Экстренное закрытие {coin} через WebUI выполнено. PNL: {net:.2f} (fee: ${close_fee:.4f}, funding: ${funding_fee:.4f})")
                         return {"status": "ok", "message": f"Позиция закрыта. PNL: {net:.2f}"}
                     else:
                         return {"status": "error", "message": close_order.get('retMsg')}
