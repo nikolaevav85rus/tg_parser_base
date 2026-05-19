@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tg_parser — Миграция на Linux</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="_assets/docs.css" rel="stylesheet">
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg fixed-top bg-dark navbar-dark doc-nav border-bottom">
+  <div class="container-fluid">
+    <a class="navbar-brand text-white" href="migration_to_linux.html">tg_parser</a>
+    <div class="d-flex align-items-center gap-1 mx-3 flex-grow-1">
+      <a class="nav-link active" href="migration_to_linux.html">Миграция на Linux</a>
+      <a class="nav-link" href="orchestrator.html">Оркестратор</a>
+    </div>
+    <span class="badge bg-warning text-dark">Planning</span>
+  </div>
+</nav>
+
+<div class="container-fluid">
+  <div class="row">
+
+    <aside class="col-lg-2 d-none d-lg-block">
+      <nav class="sidebar-nav nav flex-column pt-3">
+        <a class="nav-link" href="#context">1. Контекст</a>
+        <a class="nav-link" href="#current-state">2. Текущее состояние</a>
+        <a class="nav-link" href="#target">3. Целевая архитектура</a>
+        <a class="nav-link" href="#open-questions">4. Открытые вопросы</a>
+        <a class="nav-link" href="#phase1">Phase 1 — Linux compat</a>
+        <a class="nav-link" href="#phase2">Phase 2 — systemd</a>
+        <a class="nav-link" href="#phase3">Phase 3 — Dashboard tweaks</a>
+        <a class="nav-link" href="#phase4">Phase 4 — Controls (pause/resume)</a>
+        <a class="nav-link" href="#phase5">Phase 5 — Hard restart (опц.)</a>
+        <a class="nav-link" href="#secrets">5. Секреты</a>
+        <a class="nav-link" href="#deployment">6. Деплой и обновления</a>
+        <a class="nav-link" href="#checklist">7. Чеклист</a>
+      </nav>
+    </aside>
+
+    <main class="col-lg-10 px-md-4 py-3" id="top">
+
+      <h1 class="display-6">Миграция tg_parser на Linux-сервер</h1>
+      <p class="lead text-muted">
+        План перевода tg_parser с Windows + PyQt6 на headless Linux + web-only управление. Цель — устойчивый 24/7 запуск через systemd с управлением жизнедеятельностью бота из браузера по LAN.
+      </p>
+
+      <div class="alert alert-info py-2">
+        <strong>Перед началом миграции</strong> — сделать копию текущего проекта (git clone в новую папку или отдельный архив). Этот план применяется к копии; оригинальный <code>C:\MyPyProjects\tg_parser</code> остаётся как референс / fallback на Windows-окружение, пока миграция не завершена.
+      </div>
+
+      <!-- =================== 1. CONTEXT =================== -->
+      <section id="context" class="anchor-offset">
+        <h2>1. Контекст</h2>
+
+        <h3>Зачем мигрируем</h3>
+        <ul>
+          <li><strong>Стабильность 24/7.</strong> Windows-машина с PyQt6 tray-app требует, чтобы пользователь был залогинен (или приложение запускалось от Local System, что ломает доступ к user-specific данным). Linux-сервер с systemd работает в фоне без сессии.</li>
+          <li><strong>Цена.</strong> Сервер на cloud.ru обходится дешевле, чем держать включённым десктоп. На один сервер можно подсадить vwma_bot, tg_parser и reestr одновременно.</li>
+          <li><strong>Удалённое управление по LAN.</strong> Web UI вместо tray-app, доступен с любого устройства в локальной сети.</li>
+          <li><strong>Унификация со стеком vwma_bot.</strong> Оба бота на одном сервере, одинаковый паттерн (systemd, nginx, FastAPI, аналогичные exchange-adapters).</li>
+        </ul>
+
+        <h3>Что НЕ цель миграции</h3>
+        <ul>
+          <li>Не переписываем парсинг сигналов — он работает, не трогаем</li>
+          <li>Не меняем формат БД (SQLite остаётся, миграция данных = просто копирование <code>db/*.db</code> файлов на сервер)</li>
+          <li>Не добавляем новые источники сигналов или биржи</li>
+          <li>Не делаем CI/CD pipeline (на текущем этапе оверкилл)</li>
+        </ul>
+      </section>
+
+      <!-- =================== 2. CURRENT STATE =================== -->
+      <section id="current-state" class="anchor-offset">
+        <h2>2. Что есть сейчас (Windows-версия)</h2>
+
+        <h3>Файлы, которые останутся</h3>
+        <pre class="code-block"><code>main.py              # entry point бота
+parser.py            # парсинг Telegram-сообщений (regex-based)
+bybit_exchange.py    # обёртка над pybit
+notifier.py          # уведомления
+logger.py            # логгер
+config.py            # конфигурация
+web_server.py        # FastAPI web UI ← основа dashboard'а, остаётся
+database/            # доступ к SQLite (4 БД: coins, settings, signals, trades)
+templates/           # Jinja2 шаблоны для web UI
+utils/               # утилиты
+requirements.txt     # с правками
+config/              # конфиги
+db/                  # SQLite файлы (мигрируем как есть)
+logs/                # папка под логи
+docs/                # документация (эта)</code></pre>
+
+        <h3>Файлы под удаление</h3>
+        <pre class="code-block"><code>app_gui.py           # PyQt6 tray + GUI — не нужен на сервере
+gui_manager.py       # lifecycle GUI — не нужен
+run.pyw              # Windows GUI launcher — не нужен
+tg_parser.spec       # PyInstaller spec для Windows .exe
+icon.ico             # иконка для tray
+icon.png             # иконка
+start.bat            # Windows запуск
+install_windows.bat  # Windows-установщик
+install_windows.ps1  # PowerShell установщик
+open_firewall.bat    # Windows firewall</code></pre>
+
+        <h3>Зависимости под удаление</h3>
+        <p>В <code>requirements.txt</code> убираем:</p>
+        <ul>
+          <li><code>PyQt6==6.11.0</code></li>
+          <li><code>pywin32</code> (если есть)</li>
+        </ul>
+      </section>
+
+      <!-- =================== 3. TARGET =================== -->
+      <section id="target" class="anchor-offset">
+        <h2>3. Целевая архитектура на Linux</h2>
+
+        <pre class="code-block"><code>┌──────────────────────────────────────────────────────────────┐
+│  Ubuntu Server 24.04 LTS (cloud.ru, LAN-only)                │
+│                                                              │
+│  systemd ────► tg-parser.service                             │
+│                    │                                         │
+│                    ├─ TradingBot (asyncio loop)              │
+│                    │   ├─ Telethon client (Telegram WS)      │
+│                    │   ├─ Parser (regex)                     │
+│                    │   ├─ BybitExchange (pybit)              │
+│                    │   └─ Notifier                           │
+│                    │                                         │
+│                    └─ FastAPI + uvicorn (web UI, LAN)        │
+│                        ├─ /            dashboard             │
+│                        ├─ /signals     история сигналов      │
+│                        ├─ /trades      история сделок        │
+│                        ├─ /settings/*  настройки             │
+│                        ├─ /logs        live tail             │
+│                        ├─ /api/*       REST + control        │
+│                        └─ /ws/*        WebSocket             │
+│                                                              │
+│  Доступ — http://192.168.x.x:8001 с любого устройства LAN    │
+└──────────────────────────────────────────────────────────────┘</code></pre>
+
+        <h3>Принципы</h3>
+        <ul>
+          <li><strong>Единый процесс</strong> — бот и web UI в одном Python-процессе (как сейчас). Управление через флаги в БД, а не через signals/IPC.</li>
+          <li><strong>systemd Restart=always</strong> — при любом падении бот рестартанёт автоматически.</li>
+          <li><strong>Soft control приоритет</strong> — кнопки Pause/Resume через флаг в БД. Hard restart (через polkit + systemctl) — только аварийный.</li>
+          <li><strong>LAN-only</strong> — bind на <code>0.0.0.0:8001</code> + firewall разрешает только LAN-подсеть, либо bind на конкретный LAN-интерфейс.</li>
+          <li><strong>Логи в journald + файлы</strong> — журнал systemd для оперативного просмотра + RotatingFileHandler для долгосрочной истории.</li>
+        </ul>
+      </section>
+
+      <!-- =================== 4. OPEN QUESTIONS =================== -->
+      <section id="open-questions" class="anchor-offset">
+        <h2>4. Открытые вопросы (решить до старта Phase 4)</h2>
+        <p class="text-muted">Эти ответы определят детали реализации web UI controls. Решения фиксируются в decisions log оркестратора.</p>
+
+        <div class="table-responsive">
+          <table class="table table-fixed table-bordered">
+            <thead><tr><th style="width:35%;">Вопрос</th><th>Опции</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>Что хотим видеть на dashboard'е дополнительно к текущему?</td>
+                <td>Аптайм, # сигналов за день/неделю, # open/closed trades, текущий PNL, статус connection (Telegram / Bybit alive?), время последнего сигнала</td>
+              </tr>
+              <tr>
+                <td>Какие кнопки управления нужны?</td>
+                <td>
+                  <ul class="mb-0">
+                    <li><strong>Pause parsing</strong> — бот жив, новые сигналы не парсит</li>
+                    <li><strong>Stop trading</strong> — парсит, но ордера не отправляет (debug mode)</li>
+                    <li><strong>Force-close all positions</strong> — паника, market close всех открытых позиций</li>
+                    <li><strong>Reload Telegram session</strong> — переподключение Telethon</li>
+                    <li><strong>Reload Bybit connection</strong> — переподключение pybit</li>
+                    <li><strong>Hard restart</strong> — рестарт всего процесса (через systemd)</li>
+                  </ul>
+                </td>
+              </tr>
+              <tr>
+                <td>Где хранить секреты (Bybit key/secret, Telegram api_id/api_hash, bot token)?</td>
+                <td>
+                  <ul class="mb-0">
+                    <li><code>.env</code> файл с <code>chmod 600</code> — рекомендую</li>
+                    <li><code>EnvironmentFile=</code> в systemd unit</li>
+                    <li><code>python-keyring</code> — неудобно для headless</li>
+                    <li><code>HashiCorp Vault</code> — оверкилл</li>
+                  </ul>
+                </td>
+              </tr>
+              <tr>
+                <td>На каком порту крутить web UI?</td>
+                <td>vwma_bot планируется на 8000. tg_parser логично на 8001. reestr — 8002 (за nginx)</td>
+              </tr>
+              <tr>
+                <td>Доступ к web UI</td>
+                <td>
+                  <ul class="mb-0">
+                    <li>HTTP на LAN (без auth, basic auth, или JWT)</li>
+                    <li>Через Tailscale (только VPN-юзеры)</li>
+                  </ul>
+                  Сейчас в tg_parser auth есть?
+                </td>
+              </tr>
+              <tr>
+                <td>Hard restart через polkit нужен?</td>
+                <td>Soft control покрывает 95%. Hard restart — только если бот завис намертво. Можно отложить на потом.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- =================== PHASE 1 =================== -->
+      <section id="phase1" class="anchor-offset">
+        <h2>Phase 1 — Linux compatibility (1 день)</h2>
+
+        <p><strong>Цель:</strong> бот стартует и работает на Linux в ручном режиме (без systemd пока). Web UI открывается, парсит сигналы, торгует на testnet.</p>
+
+        <h3>Задачи</h3>
+        <ol>
+          <li>Удалить Windows-specific файлы (см. <a href="#current-state">раздел 2</a> — список под удаление)</li>
+          <li>Убрать <code>PyQt6</code> и <code>pywin32</code> из <code>requirements.txt</code></li>
+          <li>Проверить <code>config.py</code> — нет ли hardcoded Windows-путей (<code>C:\...</code>)</li>
+          <li>Проверить <code>logger.py</code> — пути к логам должны быть относительными или из переменных окружения</li>
+          <li>Проверить все <code>open(...)</code> на относительные пути</li>
+          <li>Проверить <code>main.py</code> — нет ли импортов <code>app_gui</code> или <code>gui_manager</code>, убрать если есть</li>
+          <li>Создать <code>.env.example</code> с шаблоном переменных (без секретов)</li>
+          <li>Перенести проект на сервер (rsync / git clone)</li>
+          <li>На сервере: <code>python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt</code></li>
+          <li>Создать <code>.env</code> на сервере с реальными секретами, <code>chmod 600 .env</code></li>
+          <li>Скопировать <code>db/*.db</code> с Windows-машины (или создать пустые)</li>
+          <li>Запустить вручную: <code>python -m main</code></li>
+          <li>Открыть в браузере <code>http://&lt;LAN-ip&gt;:&lt;port&gt;</code> — убедиться dashboard открывается</li>
+          <li>Послать тестовый сигнал в Telegram-канал — убедиться парсится и записывается</li>
+          <li>(Опционально) на testnet Bybit ключах — убедиться что сделка открывается</li>
+        </ol>
+
+        <h3>Acceptance criteria Phase 1</h3>
+        <ul>
+          <li>Бот стартует на Linux без ошибок импорта</li>
+          <li>Web UI доступен на LAN</li>
+          <li>Парсер обрабатывает сигналы</li>
+          <li>Сделки выполняются на testnet (если переключение testnet/mainnet есть)</li>
+          <li>Логи пишутся в <code>logs/</code></li>
+          <li>СтопCtrl+C корректно завершает бот (нет zombie-процессов)</li>
+        </ul>
+      </section>
+
+      <!-- =================== PHASE 2 =================== -->
+      <section id="phase2" class="anchor-offset">
+        <h2>Phase 2 — systemd autostart (0.5 дня)</h2>
+
+        <p><strong>Цель:</strong> бот стартует автоматически при загрузке сервера, рестартует при падении, логи в journald.</p>
+
+        <h3>Задачи</h3>
+        <ol>
+          <li>Создать пользователя <code>botuser</code> (если ещё нет общего для ботов): <code>sudo useradd -r -s /usr/sbin/nologin botuser</code></li>
+          <li>Развернуть проект в <code>/opt/tg_parser/</code>, владелец <code>botuser:botuser</code></li>
+          <li>Создать venv от имени botuser, установить deps</li>
+          <li>Создать <code>/etc/systemd/system/tg-parser.service</code> (см. шаблон ниже)</li>
+          <li><code>sudo systemctl daemon-reload</code></li>
+          <li><code>sudo systemctl enable --now tg-parser</code></li>
+          <li>Проверить <code>sudo systemctl status tg-parser</code> — должен быть active (running)</li>
+          <li>Проверить <code>sudo journalctl -u tg-parser -f</code> — должны идти логи</li>
+          <li>Тест: <code>sudo reboot</code>, после загрузки убедиться что бот сам стартанул</li>
+          <li>Тест: убить процесс через <code>kill</code>, убедиться что systemd рестартанул через 10 сек</li>
+        </ol>
+
+        <h3>Шаблон unit-файла</h3>
+        <pre class="code-block"><code># /etc/systemd/system/tg-parser.service
+[Unit]
+Description=tg_parser — Telegram signals to Bybit executor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/tg_parser
+Environment="PATH=/opt/tg_parser/venv/bin"
+EnvironmentFile=/opt/tg_parser/.env
+ExecStart=/opt/tg_parser/venv/bin/python -m main
+Restart=always
+RestartSec=10
+
+# Безопасность
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tg_parser/db /opt/tg_parser/logs
+
+# Логи в журнал systemd (плюс свои файловые в logs/)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg-parser
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+        <h3>Acceptance criteria Phase 2</h3>
+        <ul>
+          <li>Бот стартует автоматически при <code>reboot</code></li>
+          <li>Бот рестартует при ручном <code>kill</code> через 10 секунд</li>
+          <li>Логи доступны через <code>journalctl -u tg-parser</code></li>
+          <li>Web UI продолжает работать без вмешательства</li>
+        </ul>
+      </section>
+
+      <!-- =================== PHASE 3 =================== -->
+      <section id="phase3" class="anchor-offset">
+        <h2>Phase 3 — Dashboard tweaks (0.5 дня)</h2>
+
+        <p><strong>Цель:</strong> dashboard на главной странице показывает реальное состояние бота, а не только сигналы. У тебя уже есть web UI как dashboard для просмотра — этот этап его дополняет.</p>
+
+        <h3>Что добавить на главную</h3>
+        <ul>
+          <li><strong>Статусные карточки</strong>:
+            <ul>
+              <li>Bot status: ● Running / ● Paused / ● Error (если есть)</li>
+              <li>Telegram: ● Connected / ● Reconnecting / ● Offline</li>
+              <li>Bybit: ● Connected / ● Reconnecting / ● Offline</li>
+              <li>Uptime</li>
+              <li>Сигналов сегодня / за неделю</li>
+              <li>Открытых сделок / закрытых сегодня</li>
+              <li>PNL за сегодня (если считается)</li>
+            </ul>
+          </li>
+          <li><strong>Лента «Последние сигналы»</strong> (10–20 штук) — если ещё нет</li>
+          <li><strong>Лента «Активные сделки»</strong> — если ещё нет</li>
+          <li><strong>Status footer</strong>: последний event timestamp, version бота, hostname сервера</li>
+        </ul>
+
+        <h3>Технические задачи</h3>
+        <ul>
+          <li>Endpoint <code>GET /api/status</code> возвращает JSON со всеми статусами</li>
+          <li>Endpoint <code>GET /api/stats?period=today|week</code> для счётчиков</li>
+          <li>Auto-refresh dashboard каждые N секунд (через <code>setInterval</code> или WebSocket)</li>
+          <li>Connection status — Telethon и pybit имеют свойства/события, по которым можно понять состояние</li>
+        </ul>
+
+        <h3>Acceptance criteria Phase 3</h3>
+        <ul>
+          <li>Открыв главную, за 2 секунды видно: жив бот или нет, на чём оно подключено, сколько работы за сегодня</li>
+          <li>Если Telegram отвалился — на dashboard видно</li>
+          <li>Если Bybit отвалился — на dashboard видно</li>
+        </ul>
+      </section>
+
+      <!-- =================== PHASE 4 =================== -->
+      <section id="phase4" class="anchor-offset">
+        <h2>Phase 4 — Web UI controls: pause / resume (1–2 дня)</h2>
+
+        <p><strong>Цель:</strong> управление жизнедеятельностью бота из web UI без SSH. Реализация через флаги в БД (soft control), а не через сигналы процессу.</p>
+
+        <h3>Архитектура</h3>
+        <pre class="code-block"><code>┌─────────────────────────────────────────┐
+│ web UI: [PAUSE PARSING]                 │
+│         [STOP TRADING]                  │
+│         [FORCE CLOSE ALL]               │
+│         [RELOAD TELEGRAM]               │
+│         [RELOAD BYBIT]                  │
+└──────────────────┬──────────────────────┘
+                   │ POST /api/control/...
+                   ▼
+            settings.db:
+            - parser_enabled: bool
+            - trading_enabled: bool
+            - force_close_requested: bool
+            - reload_telegram_requested: bool
+            - reload_bybit_requested: bool
+                   │
+                   │ (бот читает каждые N сек)
+                   ▼
+            ┌─────────────────────┐
+            │ TradingBot main loop│
+            │                     │
+            │ if not parser_enabled:  skip parsing
+            │ if not trading_enabled: skip ордер
+            │ if force_close_requested: market close + reset
+            │ if reload_telegram_requested: reconnect + reset
+            └─────────────────────┘</code></pre>
+
+        <h3>Задачи</h3>
+        <ol>
+          <li>Добавить в <code>settings.db</code> ключи: <code>parser_enabled</code>, <code>trading_enabled</code>, <code>force_close_requested</code>, <code>reload_telegram_requested</code>, <code>reload_bybit_requested</code></li>
+          <li>В <code>main.py</code> главный loop добавить периодическую проверку этих флагов (например, раз в 2 сек)</li>
+          <li>Поведение по флагам:
+            <ul>
+              <li><code>parser_enabled=false</code> — игнорировать новые Telegram-сообщения (или Telethon handler возвращается без обработки)</li>
+              <li><code>trading_enabled=false</code> — парсер пишет сигнал в БД, но <code>BybitExchange.place_order</code> не вызывается</li>
+              <li><code>force_close_requested=true</code> — закрыть все открытые позиции market-ордерами, сбросить флаг в <code>false</code></li>
+              <li><code>reload_telegram_requested=true</code> — disconnect + reconnect Telethon, сброс флага</li>
+              <li><code>reload_bybit_requested=true</code> — пересоздать <code>BybitExchange</code> instance, сброс флага</li>
+            </ul>
+          </li>
+          <li>Endpoints <code>POST /api/control/&lt;action&gt;</code> — пишут в settings.db и возвращают новое состояние</li>
+          <li>На dashboard — кнопки с подтверждением для опасных действий (<code>force_close_all</code> требует ввод «CONFIRM» в модалку)</li>
+          <li>Логировать каждое управляющее действие в <code>logs/control.log</code> с timestamp и причиной (если есть текстовое поле)</li>
+        </ol>
+
+        <h3>Acceptance criteria Phase 4</h3>
+        <ul>
+          <li>Pause parsing — новые сигналы из Telegram не попадают в БД (или попадают со status=skipped)</li>
+          <li>Stop trading — парсятся, в БД пишутся, ордер не уходит</li>
+          <li>Force close — все открытые позиции закрываются за 30 сек</li>
+          <li>Reload Telegram — connection в статусной карточке мигает offline → connected</li>
+          <li>Все действия логируются с timestamp</li>
+          <li>Бот ни разу не упал из-за управляющих команд (graceful обработка)</li>
+        </ul>
+      </section>
+
+      <!-- =================== PHASE 5 =================== -->
+      <section id="phase5" class="anchor-offset">
+        <h2>Phase 5 — Hard restart через polkit (опционально, 0.5 дня)</h2>
+
+        <p><strong>Цель:</strong> кнопка «Hard restart» на dashboard, которая через polkit дёргает <code>systemctl restart tg-parser</code> без sudo-пароля. Нужна на случай deadlock'а, когда soft control не помогает.</p>
+
+        <p class="alert alert-warning py-2"><strong>Опционально.</strong> Soft control из Phase 4 покрывает 95% случаев. Hard restart нужен только если бот завис намертво. Можно отложить и реализовать позже, если возникнет реальная необходимость.</p>
+
+        <h3>Задачи</h3>
+        <ol>
+          <li>Создать polkit rule для разрешения <code>botuser</code> рестартить <code>tg-parser.service</code> без пароля</li>
+          <li>Endpoint <code>POST /api/control/hard_restart</code> вызывает <code>subprocess.run(["systemctl", "restart", "tg-parser"])</code></li>
+          <li>Кнопка на dashboard с двойным подтверждением (модалка с вводом «RESTART»)</li>
+        </ol>
+
+        <h3>Polkit rule</h3>
+        <pre class="code-block"><code>// /etc/polkit-1/rules.d/50-tg-parser.rules
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &amp;&amp;
+        action.lookup("unit") == "tg-parser.service" &amp;&amp;
+        (action.lookup("verb") == "restart" || action.lookup("verb") == "stop") &amp;&amp;
+        subject.user == "botuser") {
+        return polkit.Result.YES;
+    }
+});</code></pre>
+
+        <h3>Acceptance criteria Phase 5</h3>
+        <ul>
+          <li>botuser может рестартить tg-parser.service без пароля через <code>systemctl</code></li>
+          <li>Кнопка в UI рестартит сервис, dashboard через 15–20 сек снова active</li>
+          <li>Подтверждение «RESTART» обязательно — случайно не нажать</li>
+        </ul>
+      </section>
+
+      <!-- =================== 5. SECRETS =================== -->
+      <section id="secrets" class="anchor-offset">
+        <h2>5. Хранение секретов</h2>
+
+        <p>Рекомендуемый паттерн — <code>.env</code> файл с правами <code>600</code> и подгрузкой через systemd:</p>
+
+        <pre class="code-block"><code># /opt/tg_parser/.env (chmod 600, владелец botuser)
+TELEGRAM_API_ID=1234567
+TELEGRAM_API_HASH=abc...
+TELEGRAM_BOT_TOKEN=123:abc...
+BYBIT_API_KEY_TESTNET=...
+BYBIT_API_SECRET_TESTNET=...
+BYBIT_API_KEY_MAIN=...
+BYBIT_API_SECRET_MAIN=...
+ACTIVE_ENV=testnet     # или main
+
+WEB_HOST=0.0.0.0
+WEB_PORT=8001
+WEB_USER=admin
+WEB_PASSWORD_HASH=$2b$12$...    # bcrypt, если basic auth включаем
+
+LOG_LEVEL=INFO</code></pre>
+
+        <p>Установка прав:</p>
+        <pre class="code-block"><code>sudo chown botuser:botuser /opt/tg_parser/.env
+sudo chmod 600 /opt/tg_parser/.env
+# Проверка — только botuser может читать:
+ls -l /opt/tg_parser/.env
+# -rw------- 1 botuser botuser 512 ... .env</code></pre>
+
+        <p>В systemd unit: <code>EnvironmentFile=/opt/tg_parser/.env</code> — переменные подгружаются и доступны процессу через <code>os.getenv()</code>.</p>
+
+        <p class="text-muted small">В коде <code>config.py</code> читать через <code>python-dotenv</code> для локальной разработки (вне systemd) или просто <code>os.getenv()</code> — systemd сам выставит переменные.</p>
+      </section>
+
+      <!-- =================== 6. DEPLOYMENT =================== -->
+      <section id="deployment" class="anchor-offset">
+        <h2>6. Деплой и обновления</h2>
+
+        <h3>Первичная установка</h3>
+        <pre class="code-block"><code># На сервере, под root:
+useradd -r -s /usr/sbin/nologin botuser
+mkdir -p /opt/tg_parser
+chown botuser:botuser /opt/tg_parser
+
+# Клонируем код (или rsync с локалки)
+sudo -u botuser git clone https://github.com/&lt;you&gt;/tg_parser.git /opt/tg_parser
+cd /opt/tg_parser
+
+# venv
+sudo -u botuser python3 -m venv venv
+sudo -u botuser ./venv/bin/pip install -r requirements.txt
+
+# Секреты
+sudo cp .env.example /opt/tg_parser/.env
+sudo nano /opt/tg_parser/.env       # вписать реальные значения
+sudo chown botuser:botuser /opt/tg_parser/.env
+sudo chmod 600 /opt/tg_parser/.env
+
+# БД (если переносим с Windows)
+sudo cp /path/to/copied/db/*.db /opt/tg_parser/db/
+sudo chown -R botuser:botuser /opt/tg_parser/db /opt/tg_parser/logs
+
+# systemd
+sudo cp deploy/tg-parser.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tg-parser
+sudo systemctl status tg-parser</code></pre>
+
+        <h3>Обновление кода</h3>
+        <pre class="code-block"><code># После пуша в GitHub:
+cd /opt/tg_parser
+sudo -u botuser git pull
+sudo -u botuser ./venv/bin/pip install -r requirements.txt   # если изменились deps
+sudo systemctl restart tg-parser
+sudo systemctl status tg-parser
+sudo journalctl -u tg-parser -n 50</code></pre>
+
+        <p class="text-muted small">При обновлении БД-схемы — добавить миграцию в код (через <code>_upgrade_db</code> функцию по образцу vwma_bot), чтобы рестарт сам мигрировал.</p>
+      </section>
+
+      <!-- =================== 7. CHECKLIST =================== -->
+      <section id="checklist" class="anchor-offset">
+        <h2>7. Финальный чеклист — миграция считается завершённой когда…</h2>
+
+        <ul class="list-group">
+          <li class="list-group-item">☐ Бот стартует автоматически при загрузке сервера (Phase 2)</li>
+          <li class="list-group-item">☐ Бот рестартует при ручном <code>kill -9</code> через ≤ 15 секунд (Phase 2)</li>
+          <li class="list-group-item">☐ Web UI открывается с любого устройства LAN по http://&lt;server-ip&gt;:8001 (Phase 1)</li>
+          <li class="list-group-item">☐ На главной dashboard видны: bot status, Telegram status, Bybit status, # сигналов сегодня, # активных сделок (Phase 3)</li>
+          <li class="list-group-item">☐ Кнопка Pause работает — парсер перестаёт обрабатывать новые сигналы (Phase 4)</li>
+          <li class="list-group-item">☐ Кнопка Stop Trading работает — сигналы парсятся, ордера не отправляются (Phase 4)</li>
+          <li class="list-group-item">☐ Кнопка Force Close требует ввод подтверждения, закрывает все позиции (Phase 4)</li>
+          <li class="list-group-item">☐ Логи доступны через <code>journalctl -u tg-parser</code> и в файлах <code>logs/</code> (Phase 2)</li>
+          <li class="list-group-item">☐ Все управляющие действия логируются в отдельный <code>logs/control.log</code> (Phase 4)</li>
+          <li class="list-group-item">☐ Секреты в <code>.env</code> с правами 600, владелец botuser (раздел 5)</li>
+          <li class="list-group-item">☐ Никаких упоминаний PyQt6, pywin32, .bat, .ico в коде (Phase 1)</li>
+          <li class="list-group-item">☐ Все тесты (если есть) проходят на Linux окружении</li>
+          <li class="list-group-item">☐ Reboot сервера — после загрузки бот сам активен через 30–60 сек</li>
+          <li class="list-group-item">☐ (Опц.) Hard restart кнопка работает через polkit (Phase 5)</li>
+        </ul>
+
+        <p class="mt-3">После всех галочек — testnet прогон 1 неделю, потом переключение на mainnet ключи в <code>.env</code> + рестарт.</p>
+      </section>
+
+      <footer class="doc-footer">
+        <p class="mb-1">
+          <strong>Связанные страницы:</strong>
+          <a href="orchestrator.html">Оркестратор — pattern разработки</a>
+        </p>
+        <p class="mb-0">Источник истины при миграции — этот документ. Изменения плана фиксировать здесь же.</p>
+      </footer>
+
+    </main>
+  </div>
+</div>
+
+<script src="_assets/docs-nav.js"></script>
+
+</body>
+</html>

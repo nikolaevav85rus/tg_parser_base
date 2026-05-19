@@ -1,0 +1,186 @@
+/* Shared styles for vwma_bot documentation pages */
+
+:root {
+  --sacred-bg: #fff5f5;
+  --sacred-border: #dc3545;
+  --formula-bg: #f8f9fa;
+  --kbd-bg: #212529;
+  --doc-nav-active: #ffc107;
+}
+
+body { padding-top: 4.5rem; font-size: 15px; }
+
+/* Top doc-nav */
+.doc-nav .navbar-brand { font-weight: 700; letter-spacing: 0.3px; }
+.doc-nav .nav-link { color: rgba(255, 255, 255, 0.75); padding: 0.4rem 0.85rem; font-size: 0.95rem; border-radius: 0.25rem; transition: background 0.15s, color 0.15s; }
+.doc-nav .nav-link:hover { color: white; background: rgba(255, 255, 255, 0.1); }
+.doc-nav .nav-link.active { color: #212529; background: var(--doc-nav-active); font-weight: 600; }
+
+/* Sidebar */
+.sidebar-nav { position: sticky; top: 5rem; max-height: calc(100vh - 6rem); overflow-y: auto; }
+.sidebar-nav .nav-link { font-size: 0.875rem; padding: 0.2rem 0.5rem; color: #495057; }
+.sidebar-nav .nav-link.active { font-weight: 600; color: #0d6efd; border-left: 2px solid #0d6efd; }
+
+/* Section headings */
+h2 { margin-top: 2.5rem; padding-bottom: 0.5rem; border-bottom: 1px solid #dee2e6; }
+h3 { margin-top: 1.75rem; font-size: 1.25rem; }
+
+/* Sacred / invariant blocks */
+.sacred {
+  background: var(--sacred-bg);
+  border-left: 4px solid var(--sacred-border);
+  padding: 0.75rem 1rem;
+  border-radius: 0.25rem;
+  margin: 1rem 0;
+}
+.sacred-badge {
+  background: var(--sacred-border);
+  color: white;
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+/* Formula / code blocks */
+.formula {
+  background: var(--formula-bg);
+  border: 1px solid #dee2e6;
+  border-radius: 0.25rem;
+  padding: 0.6rem 0.9rem;
+  font-family: "Consolas", "Cascadia Mono", monospace;
+  font-size: 0.875rem;
+  margin: 0.5rem 0;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+code {
+  background: #f1f3f5;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.2rem;
+  color: #c7254e;
+  font-size: 0.9em;
+}
+pre.code-block {
+  background: #212529;
+  color: #e9ecef;
+  border-radius: 0.4rem;
+  padding: 0.9rem 1.1rem;
+  font-size: 0.85rem;
+  overflow-x: auto;
+  line-height: 1.45;
+}
+pre.code-block code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+/* Tables */
+.table-fixed { table-layout: auto; font-size: 0.875rem; }
+.table-fixed th { background: #f8f9fa; font-weight: 600; vertical-align: middle; }
+.table-fixed td { vertical-align: middle; }
+
+/* Level tags (X100/X50/X25) */
+.level-tag {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin: 0.05rem 0.1rem;
+  color: white;
+}
+.level-x100 { background: #6c757d; }
+.level-x50 { background: #fd7e14; }
+.level-x25 { background: #dc3545; }
+.level-all { background: #198754; }
+
+/* Risk pills */
+.risk-pill {
+  display: inline-block;
+  width: 2.5em;
+  text-align: center;
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.25rem;
+  font-family: "Consolas", monospace;
+  font-weight: 600;
+}
+.risk-0 { background: #d1e7dd; color: #0a3622; }
+.risk-1 { background: #cff4fc; color: #055160; }
+.risk-2 { background: #fff3cd; color: #664d03; }
+.risk-3 { background: #f8d7da; color: #58151c; }
+
+/* Stage flow diagram */
+.stage-flow {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 1rem 0;
+}
+.stage-box {
+  border: 1px solid #dee2e6;
+  border-radius: 0.25rem;
+  padding: 0.5rem 0.75rem;
+  background: white;
+  font-size: 0.875rem;
+  min-width: 110px;
+  text-align: center;
+}
+.stage-arrow { color: #6c757d; font-weight: 600; }
+
+/* Stat cards */
+.meta-card {
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  height: 100%;
+}
+.meta-card .label { font-size: 0.75rem; color: #6c757d; text-transform: uppercase; letter-spacing: 0.5px; }
+.meta-card .value { font-size: 1.5rem; font-weight: 600; color: #212529; }
+.meta-card .unit { font-size: 0.875rem; color: #6c757d; margin-left: 0.25rem; }
+
+/* Misc */
+.danger-list li { margin-bottom: 0.4rem; }
+.danger-list li::marker { color: var(--sacred-border); }
+.anchor-offset { scroll-margin-top: 5rem; }
+kbd {
+  background: var(--kbd-bg);
+  color: white;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.2rem;
+  font-size: 0.8rem;
+}
+
+/* Doc-page hub cards (for index/landing) */
+.hub-card {
+  border: 1px solid #dee2e6;
+  border-radius: 0.5rem;
+  padding: 1.25rem;
+  height: 100%;
+  background: white;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  text-decoration: none;
+  color: inherit;
+  display: block;
+}
+.hub-card:hover {
+  border-color: #0d6efd;
+  box-shadow: 0 0.25rem 0.5rem rgba(13, 110, 253, 0.1);
+  color: inherit;
+}
+.hub-card h4 { margin-top: 0; margin-bottom: 0.5rem; color: #0d6efd; }
+.hub-card p { margin-bottom: 0; color: #6c757d; font-size: 0.9rem; }
+
+/* Footer */
+.doc-footer {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 1px solid #dee2e6;
+  color: #6c757d;
+  font-size: 0.85rem;
+}

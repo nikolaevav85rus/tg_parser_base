@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tg_parser — Работа с оркестратором</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="_assets/docs.css" rel="stylesheet">
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg fixed-top bg-dark navbar-dark doc-nav border-bottom">
+  <div class="container-fluid">
+    <a class="navbar-brand text-white" href="migration_to_linux.html">tg_parser</a>
+    <div class="d-flex align-items-center gap-1 mx-3 flex-grow-1">
+      <a class="nav-link" href="migration_to_linux.html">Миграция на Linux</a>
+      <a class="nav-link active" href="orchestrator.html">Оркестратор</a>
+    </div>
+    <span class="badge bg-warning text-dark">Planning</span>
+  </div>
+</nav>
+
+<div class="container-fluid">
+  <div class="row">
+
+    <aside class="col-lg-2 d-none d-lg-block">
+      <nav class="sidebar-nav nav flex-column pt-3">
+        <a class="nav-link" href="#why">1. Зачем оркестратор</a>
+        <a class="nav-link" href="#architecture">2. Архитектура pattern'а</a>
+        <a class="nav-link" href="#commands">3. Команды</a>
+        <a class="nav-link" href="#cycle">4. Полный цикл</a>
+        <a class="nav-link" href="#storage">5. Где что хранится</a>
+        <a class="nav-link" href="#setup">6. Setup оркестратора для tg_parser</a>
+        <a class="nav-link" href="#worked-example">7. Walkthrough Phase 1</a>
+        <a class="nav-link" href="#when-same">8. Когда один чат</a>
+        <a class="nav-link" href="#when-new">9. Когда новый чат</a>
+        <a class="nav-link" href="#troubleshooting">10. Troubleshooting</a>
+      </nav>
+    </aside>
+
+    <main class="col-lg-10 px-md-4 py-3" id="top">
+
+      <h1 class="display-6">Работа с оркестратором</h1>
+      <p class="lead text-muted">
+        Памятка по orchestrator + worker pattern'у для разработки и миграции tg_parser. Тот же подход, что используется в vwma_bot — позволяет вести проект через несколько Claude Code-сессий без потери контекста и без перерасхода токенов.
+      </p>
+
+      <!-- =================== 1. WHY =================== -->
+      <section id="why" class="anchor-offset">
+        <h2>1. Зачем оркестратор</h2>
+
+        <h3>1.1. Проблема длинных чатов</h3>
+        <p>Миграция tg_parser — это 5 фаз работы (см. <a href="migration_to_linux.html">migration_to_linux.html</a>). Если вести её в одном чате, упрёшься в три проблемы:</p>
+        <ul>
+          <li><strong>Context-лимит.</strong> Окно Claude Code ~200K токенов. После compaction теряются детали ранних решений.</li>
+          <li><strong>Стоимость.</strong> Каждый turn в большом чате обрабатывает весь предыдущий контекст. К концу миграции turn в 5–10× дороже стартового.</li>
+          <li><strong>Скорость.</strong> Длинные чаты медленнее.</li>
+        </ul>
+
+        <h3>1.2. Решение — два типа чатов</h3>
+        <div class="row g-3">
+          <div class="col-md-6">
+            <div class="meta-card">
+              <div class="label">Orchestrator-чат</div>
+              <div class="value" style="font-size:1.1rem;">долгий, недели</div>
+              <p class="text-muted small mt-2 mb-0">
+                Планирует, читает прогресс, выдаёт промпты, ведёт <code>docs/progress.html</code>. Не пишет код. Минимум контекста на turn.
+              </p>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <div class="meta-card">
+              <div class="label">Worker-чат</div>
+              <div class="value" style="font-size:1.1rem;">короткий, одна задача</div>
+              <p class="text-muted small mt-2 mb-0">
+                Получает self-contained промпт от оркестратора, делает работу (код+тесты+коммит), сообщает результат назад. Закрывается после коммита.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <h3>1.3. Передача контекста между чатами</h3>
+        <p>Контекст НЕ передаётся через память — он передаётся через файлы:</p>
+        <ul>
+          <li><code>CLAUDE.md</code> — core-знания о проекте (автозагружается в любую сессию)</li>
+          <li><code>docs/migration_to_linux.html</code> — план миграции, roadmap</li>
+          <li><code>docs/progress.html</code> — текущее состояние (ведётся оркестратором)</li>
+          <li><code>git log</code> + commit messages — история действий</li>
+        </ul>
+        <p>Любая новая сессия Claude Code (orchestrator или worker) восстанавливает контекст из этих источников.</p>
+      </section>
+
+      <!-- =================== 2. ARCHITECTURE =================== -->
+      <section id="architecture" class="anchor-offset">
+        <h2>2. Архитектура pattern'а</h2>
+        <pre class="code-block"><code>┌────────────────────────────────────────────────────────────────┐
+│  Orchestrator chat (одна сессия может жить недели)             │
+│                                                                │
+│  Что хранит в голове:                                          │
+│    - Roadmap (5 фаз миграции из migration_to_linux.html)       │
+│    - Текущий state (читает progress.html + git log)            │
+│    - Открытые блокеры                                          │
+│                                                                │
+│  Что делает по команде:                                        │
+│    /orchestrator        → status report                        │
+│    /orchestrator next   → выдать промпт для worker             │
+│    /orchestrator done X → принять результат, обновить progress │
+│    /orchestrator block  → зафиксировать блокер                 │
+│    /orchestrator pause  → закрыть сессию, коммит progress      │
+└──────────────────────┬──────────────────────▲──────────────────┘
+                       │ промпт               │ "/orchestrator done abc123"
+                       ▼                      │
+┌──────────────────────────────────────────────┴─────────────────┐
+│  Worker chat (одна задача = одна сессия)                       │
+│                                                                │
+│  1. Получает self-contained промпт                             │
+│  2. git status → читает релевантные docs                       │
+│  3. Пишет код, тесты                                           │
+│  4. ruff / mypy / pytest                                       │
+│  5. git commit с осмысленным сообщением                        │
+│  6. Возвращается в orchestrator-чат: "/orchestrator done HASH" │
+└────────────────────────────────────────────────────────────────┘</code></pre>
+      </section>
+
+      <!-- =================== 3. COMMANDS =================== -->
+      <section id="commands" class="anchor-offset">
+        <h2>3. Команды оркестратора</h2>
+
+        <div class="table-responsive">
+          <table class="table table-fixed table-bordered">
+            <thead><tr><th style="width:25%;">Команда</th><th style="width:25%;">Когда вызывать</th><th>Что делает</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>/orchestrator</code></td>
+                <td>В начале каждой orchestrator-сессии</td>
+                <td>Startup-ритуал: читает <code>progress.html</code>, запускает <code>git log</code>/<code>git status</code>, сверяет с roadmap, отчитывается status report'ом</td>
+              </tr>
+              <tr>
+                <td><code>/orchestrator next</code></td>
+                <td>Когда готов запустить новый worker-чат</td>
+                <td>Готовит copy-pasteable промпт со всем контекстом (задача, ссылки на доки, acceptance criteria). Промпт самодостаточный — worker не должен возвращаться за разъяснениями</td>
+              </tr>
+              <tr>
+                <td><code>/orchestrator done &lt;hash&gt;</code></td>
+                <td>Когда worker-чат закоммитил результат</td>
+                <td>Читает <code>git show &lt;hash&gt;</code>, проверяет соответствие задаче, обновляет <code>progress.html</code> (done → ✅), планирует следующую задачу</td>
+              </tr>
+              <tr>
+                <td><code>/orchestrator block &lt;desc&gt;</code></td>
+                <td>Когда worker сообщил о блокере, или нашёл blocker сам</td>
+                <td>Фиксирует в <code>progress.html</code> → Blockers. Если требует решения пользователя — задаёт вопрос через <code>AskUserQuestion</code></td>
+              </tr>
+              <tr>
+                <td><code>/orchestrator pause</code></td>
+                <td>В конце orchestrator-сессии</td>
+                <td>Обновляет <code>progress.html</code>, закоммитит его (<code>docs(progress): ...</code>), даёт summary что сделано / что дальше / какие блокеры</td>
+              </tr>
+              <tr>
+                <td><code>/orchestrator costs</code></td>
+                <td>Раз в 1–2 недели, или когда хочется проверить бюджет</td>
+                <td>Запускает skill <code>session-report:session-report</code> с окном 7 дней. Генерирует <code>./session-report-YYYYMMDD-HHMM.html</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Команды worker-чата</h3>
+        <p>tg_parser изначально не имеет project-specific slash commands и subagents (как у vwma_bot). После миграции можно их добавить по аналогии. На время миграции worker использует:</p>
+        <ul>
+          <li><code>ruff check &lt;files&gt;</code> — линтер</li>
+          <li><code>ruff format &lt;files&gt;</code> — форматтер</li>
+          <li><code>pytest tests/</code> — тесты (если есть)</li>
+          <li><code>git commit</code> — коммит</li>
+          <li>Subagent <code>pr-review-toolkit:code-reviewer</code> — code review перед коммитом сложных изменений</li>
+          <li>Subagent <code>pr-review-toolkit:silent-failure-hunter</code> — проверка на silent failures (особенно важно для управляющих endpoint'ов)</li>
+        </ul>
+      </section>
+
+      <!-- =================== 4. CYCLE =================== -->
+      <section id="cycle" class="anchor-offset">
+        <h2>4. Полный цикл одной задачи</h2>
+
+        <div class="stage-flow my-3">
+          <div class="stage-box bg-light">
+            <div class="fw-bold">1. User</div>
+            <small class="text-muted">/orchestrator</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box" style="background:#cfe2ff;">
+            <div class="fw-bold">2. Orchestrator</div>
+            <small class="text-muted">status report</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box bg-light">
+            <div class="fw-bold">3. User</div>
+            <small class="text-muted">/orchestrator next</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box" style="background:#cfe2ff;">
+            <div class="fw-bold">4. Orchestrator</div>
+            <small class="text-muted">выдаёт промпт</small>
+          </div>
+        </div>
+
+        <div class="stage-flow my-3">
+          <div class="stage-box bg-light">
+            <div class="fw-bold">5. User</div>
+            <small class="text-muted">копирует в новый чат</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box" style="background:#d1e7dd;">
+            <div class="fw-bold">6. Worker</div>
+            <small class="text-muted">код + тесты + commit</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box bg-light">
+            <div class="fw-bold">7. User</div>
+            <small class="text-muted">копирует hash</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box bg-light">
+            <div class="fw-bold">8. User</div>
+            <small class="text-muted">/orchestrator done HASH</small>
+          </div>
+          <div class="stage-arrow">→</div>
+          <div class="stage-box" style="background:#cfe2ff;">
+            <div class="fw-bold">9. Orchestrator</div>
+            <small class="text-muted">обновляет progress.html</small>
+          </div>
+        </div>
+
+        <p>Цикл повторяется. Когда worker заблокирован — пользователь возвращается в orchestrator-чат с <code>/orchestrator block ...</code>.</p>
+      </section>
+
+      <!-- =================== 5. STORAGE =================== -->
+      <section id="storage" class="anchor-offset">
+        <h2>5. Где что хранится</h2>
+        <div class="table-responsive">
+          <table class="table table-fixed table-bordered">
+            <thead>
+              <tr>
+                <th style="width:25%;">Источник</th>
+                <th style="width:25%;">Что содержит</th>
+                <th style="width:25%;">Кто обновляет</th>
+                <th>Кто читает</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>CLAUDE.md</code></td>
+                <td>Описание проекта, стек, ключевые правила, точки входа</td>
+                <td>Редко (значимые изменения проекта)</td>
+                <td>Все сессии автоматически</td>
+              </tr>
+              <tr>
+                <td><code>docs/migration_to_linux.html</code></td>
+                <td>5 фаз миграции, чеклист, архитектура целевой системы</td>
+                <td>Когда меняется план</td>
+                <td>Orchestrator каждый старт, worker по запросу</td>
+              </tr>
+              <tr>
+                <td><code>docs/orchestrator.html</code></td>
+                <td>Этот документ — памятка по pattern'у</td>
+                <td>Когда pattern эволюционирует</td>
+                <td>Пользователь</td>
+              </tr>
+              <tr>
+                <td><code>docs/progress.html</code></td>
+                <td>Текущее состояние: Roadmap, Done, In-progress, Blockers, Backlog, Decisions log</td>
+                <td>Orchestrator на каждый <code>done</code>/<code>block</code>/<code>pause</code></td>
+                <td>Orchestrator каждый старт</td>
+              </tr>
+              <tr>
+                <td><code>git log</code> + commit messages</td>
+                <td>История действий, hash как идентификатор задачи</td>
+                <td>Worker на каждом commit</td>
+                <td>Orchestrator каждый старт + при <code>done</code></td>
+              </tr>
+              <tr>
+                <td><code>./session-report-*.html</code></td>
+                <td>Usage-аналитика (токены, кеш, дорогие промпты)</td>
+                <td>Orchestrator при <code>/orchestrator costs</code></td>
+                <td>Пользователь</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-muted small">Файлы <code>session-report-*.html</code> добавить в <code>.gitignore</code> — они генерируются локально и не коммитятся.</p>
+      </section>
+
+      <!-- =================== 6. SETUP =================== -->
+      <section id="setup" class="anchor-offset">
+        <h2>6. Setup оркестратора для tg_parser (один раз)</h2>
+
+        <p>tg_parser ещё не имеет настроенного оркестратора (на момент написания). Перед стартом миграции нужно подготовить инфраструктуру:</p>
+
+        <h3>6.1. Создать <code>CLAUDE.md</code> в корне проекта</h3>
+        <p>Файл-память, который автозагружается во все Claude Code сессии в этом проекте. Минимальное содержимое:</p>
+        <ul>
+          <li>Краткое описание: что делает tg_parser</li>
+          <li>Стек: Python 3.11+, FastAPI, Telethon, pybit, aiosqlite</li>
+          <li>Точки входа: <code>main.py</code> (бот), <code>web_server.py</code> (FastAPI)</li>
+          <li>Текущая фаза: migration to Linux (ссылка на <code>docs/migration_to_linux.html</code>)</li>
+          <li>Sensitive areas: торгует реальными деньгами на Bybit, изменения в логике торговли — с осторожностью</li>
+          <li>Где секреты: <code>.env</code> файл (gitignored)</li>
+          <li>Code style: <code>ruff format</code>, line-length 120, type hints где разумно</li>
+        </ul>
+
+        <h3>6.2. Скопировать <code>.claude/commands/orchestrator.md</code> из vwma_bot</h3>
+        <p>Файл <code>C:\MyPyProjects\vwma_bot\.claude\commands\orchestrator.md</code> — это slash-command оркестратора. Скопируй его в <code>C:\MyPyProjects\tg_parser\.claude\commands\orchestrator.md</code> с правками:</p>
+        <ul>
+          <li>Заменить ссылки на <code>Doc/</code> → <code>docs/</code> (у tg_parser маленькая буква)</li>
+          <li>Заменить ссылки на <code>strategy.html</code>, <code>architecture.html</code>, <code>rules.html</code> → <code>migration_to_linux.html</code> + другие docs, если появятся</li>
+          <li>Заменить упоминания фаз 0–14 → 5 фаз миграции</li>
+          <li>Убрать sacred-rules про <code>strategy_core.py</code> (у tg_parser нет такого инварианта)</li>
+          <li>Убрать упоминания project-specific агентов vwma_bot (strategy-invariant-guardian и др.) — у tg_parser их пока нет</li>
+        </ul>
+
+        <h3>6.3. <code>.claude/settings.json</code> (опционально)</h3>
+        <p>Project-level settings с allowlist для типовых dev-команд: <code>ruff</code>, <code>pytest</code>, <code>git status/diff/log</code>, <code>python -c</code>. Можно скопировать структуру из vwma_bot и адаптировать.</p>
+
+        <h3>6.4. Привязка к GitHub repo</h3>
+        <p>Если планируешь хранить миграционную копию tg_parser отдельно от оригинала — создай новый GitHub repo (например <code>tg_parser-linux</code>) и привяжи к копии проекта (по образцу <a href="../../vwma_bot/Doc/architecture.html">vwma_bot</a>).</p>
+
+        <h3>6.5. Запуск первого <code>/orchestrator</code></h3>
+        <p>После шагов 6.1–6.3 открой новый Claude Code чат в копии проекта, набери <code>/orchestrator</code>. Оркестратор:</p>
+        <ol>
+          <li>Прочитает <code>CLAUDE.md</code> и <code>docs/migration_to_linux.html</code></li>
+          <li>Запустит <code>git log</code> — увидит свежий repo</li>
+          <li>Создаст <code>docs/progress.html</code> по шаблону (с пятью фазами миграции в статусе ⬜ pending)</li>
+          <li>Отдаст status report и предложит первую задачу</li>
+        </ol>
+      </section>
+
+      <!-- =================== 7. WORKED EXAMPLE =================== -->
+      <section id="worked-example" class="anchor-offset">
+        <h2>7. Walkthrough — Phase 1 (Linux compatibility)</h2>
+
+        <h3>День 1 — старт orchestrator-чата</h3>
+        <pre class="code-block"><code>User: /orchestrator
+
+Orchestrator:
+  📊 Status: Migration Phase 1 — Linux compatibility (planning)
+  ✅ Завершено: setup инфраструктуры (CLAUDE.md, docs/, оркестратор)
+  🔄 В работе: ничего
+  ⛔ Блокеры: нет
+  ➡️ Следующее: удаление Windows-specific файлов + правка requirements.txt
+
+  Команды: /orchestrator next | done &lt;hash&gt; | block &lt;desc&gt; | pause | costs
+
+User: /orchestrator next
+
+Orchestrator: Промпт ниже — копируй в новый Claude Code чат:
+
+─────────────────────────────────────────
+Я работаю в проекте tg_parser-linux (миграция на Linux).
+CLAUDE.md и docs/ автоматически подгружены.
+
+## Задача
+Phase 1.1 — удалить Windows-specific файлы из проекта и очистить requirements.txt от PyQt6 / pywin32.
+
+## Контекст
+- Полный план миграции: docs/migration_to_linux.html, разделы "Phase 1" и "Что есть сейчас"
+- Цель этапа: проект импортируется и запускается на Linux окружении (после venv)
+- Не трогать: парсер, БД, web_server.py, main loop логику
+
+## Acceptance criteria
+- [ ] Удалены: app_gui.py, gui_manager.py, run.pyw, tg_parser.spec, icon.ico, icon.png, start.bat, install_windows.bat, install_windows.ps1, open_firewall.bat
+- [ ] requirements.txt: PyQt6 и pywin32 удалены
+- [ ] main.py — проверь, нет ли импортов app_gui / gui_manager, убери если есть
+- [ ] config.py — нет hardcoded Windows-путей (C:\... ); все пути относительные
+- [ ] logger.py — пути к логам относительные
+- [ ] Коммит с осмысленным сообщением
+- [ ] (Не запускать pip install — это будет на сервере)
+
+## Старт
+git status → читай docs/migration_to_linux.html → действуй.
+
+После завершения сообщи мне (оркестратору) в orchestrator-чате:
+"/orchestrator done &lt;hash&gt;"
+─────────────────────────────────────────</code></pre>
+
+        <h3>Worker делает работу</h3>
+        <pre class="code-block"><code>Worker: ... удаляет файлы, чистит requirements.txt, проверяет импорты ...
+
+git log --oneline -1
+abc1234 chore(linux): remove Windows-specific files (PyQt6, GUI, .bat)</code></pre>
+
+        <h3>Возврат в orchestrator</h3>
+        <pre class="code-block"><code>User: /orchestrator done abc1234
+
+Orchestrator:
+  Проверил git show abc1234:
+  - 10 файлов удалено (app_gui.py, gui_manager.py, ... )
+  - requirements.txt: -PyQt6, -pywin32
+  - main.py: убраны импорты gui_manager
+  - config.py: hardcoded путь "C:\\Users\\..." заменён на os.path.expanduser("~/.config/tg_parser")
+
+  Обновил docs/progress.html:
+  - Phase 1.1 (cleanup Windows files): ✅ done (abc1234, 2026-05-13)
+  - Phase 1 прогресс: 1/8 шагов из чеклиста
+
+  Готов выдать следующую задачу (/orchestrator next) или подождать.</code></pre>
+      </section>
+
+      <!-- =================== 8. WHEN SAME =================== -->
+      <section id="when-same" class="anchor-offset">
+        <h2>8. Когда оставаться в одном чате</h2>
+        <ul>
+          <li><strong>Маленький фикс</strong> (5–10 минут): поправил опечатку, добавил docstring</li>
+          <li><strong>Тесно связанные работы</strong>: добавление endpoint + сразу тест в одном чате</li>
+          <li><strong>Архитектурное обсуждение</strong>: пока выясняем дизайн — один чат до момента «теперь знаем что делать»</li>
+          <li><strong>Багфикс с воспроизведением</strong>: написал тест воспроизводящий баг → чинишь — один чат</li>
+        </ul>
+      </section>
+
+      <!-- =================== 9. WHEN NEW =================== -->
+      <section id="when-new" class="anchor-offset">
+        <h2>9. Когда обязательно новый чат</h2>
+        <ul>
+          <li><strong>Новая Phase</strong>: Phase 1 → Phase 2 — всегда новый orchestrator-цикл</li>
+          <li><strong>Context уже compaction'нулся</strong>: чувствуешь, что Claude забывает ранние детали</li>
+          <li><strong>Долгая пауза</strong> (день+)</li>
+          <li><strong>Смена контекста</strong>: было удаление Windows-файлов, теперь web UI — разные части, новый чат</li>
+          <li><strong>Параллельные задачи</strong>: один чат фиксит баг, другой пишет следующую фазу</li>
+          <li><strong>После принятия решения</strong>: было exploration, теперь implementation</li>
+        </ul>
+      </section>
+
+      <!-- =================== 10. TROUBLESHOOTING =================== -->
+      <section id="troubleshooting" class="anchor-offset">
+        <h2>10. Troubleshooting</h2>
+
+        <h3>Оркестратор начал писать код</h3>
+        <p>Скажи: «остановись, ты оркестратор, не делай работу сам — выдай промпт через <code>/orchestrator next</code>». Если повторяется — открой новый orchestrator-чат, ролевое поведение «забылось».</p>
+
+        <h3>Worker не вернулся с hash</h3>
+        <p>В orchestrator-чате: <code>/orchestrator done</code> без аргумента — оркестратор посмотрит <code>git log</code>, найдёт последние коммиты, спросит какой считать выполненной задачей.</p>
+
+        <h3>Worker сделал не то что просили</h3>
+        <p><code>git revert &lt;hash&gt;</code> в worker-чате (или новом). Зафиксируй причину в orchestrator: <code>/orchestrator block worker неправильно понял задачу X, нужен переформулированный промпт</code>. Оркестратор переформулирует на следующем <code>next</code>.</p>
+
+        <h3>Progress.html рассинхронизировался с git</h3>
+        <p>В orchestrator-чате: «прочитай <code>git log --oneline -30</code>, сверь с <code>progress.html</code>, перестрой Done под реальное состояние».</p>
+
+        <h3>Слишком много turn'ов в orchestrator-чате — стало дорого</h3>
+        <p><code>/orchestrator pause</code> → закрой чат → открой новый и снова <code>/orchestrator</code>. Свежий контекст. <code>progress.html</code> держит всю историю.</p>
+
+        <h3>Worker торгует реальными деньгами на mainnet — страшно</h3>
+        <p>Это не баг pattern'а, это правильное ощущение. Для миграции tg_parser <strong>обязательно используй testnet</strong> ключи Bybit на сервере до завершения Phase 5 + одного спокойного дня testnet-прогона. Mainnet включается только после полного чеклиста (см. <a href="migration_to_linux.html#checklist">migration_to_linux.html → раздел 7</a>) + личного подтверждения.</p>
+      </section>
+
+      <footer class="doc-footer">
+        <p class="mb-1">
+          <strong>Связанные страницы:</strong>
+          <a href="migration_to_linux.html">Миграция на Linux</a>
+        </p>
+        <p class="mb-1">Pattern и команды совпадают с тем, что используется в проекте vwma_bot — это намеренно: единый workflow на оба проекта.</p>
+        <p class="mb-0">Файл <code>docs/progress.html</code> создаётся оркестратором автоматически при первом запуске.</p>
+      </footer>
+
+    </main>
+  </div>
+</div>
+
+<script src="_assets/docs-nav.js"></script>
+
+</body>
+</html>
