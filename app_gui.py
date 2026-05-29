@@ -45,18 +45,73 @@ class BotWorker(QThread):
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def run(self) -> None:
+        import traceback
+        import concurrent.futures.thread as _cft
+        from concurrent.futures import ThreadPoolExecutor
+
+        # КРИТИЧНО: после предыдущего цикла жизни BotWorker глобальный _shutdown
+        # в concurrent.futures.thread может остаться True (срабатывает atexit-хук
+        # из threading). Тогда любой asyncio.to_thread / run_in_executor падает
+        # с "cannot schedule new futures after interpreter shutdown". Сбрасываем.
+        try:
+            _cft._shutdown = False
+        except Exception:
+            pass
+
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        bot = TradingBot()
-        self.started_signal.emit()
+
+        # Свой ThreadPoolExecutor вместо дефолтного — полная изоляция
+        # от других циклов жизни BotWorker.
+        executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="bot-io")
+        self._loop.set_default_executor(executor)
+
         try:
-            self._loop.run_until_complete(bot.run())
+            bot = TradingBot()
+            self.started_signal.emit()
+            try:
+                self._loop.run_until_complete(bot.run())
+            except Exception as e:
+                tb = traceback.format_exc()
+                bot_logger.error(f"BotWorker: исключение в bot.run(): {e}\n{tb}")
+                self.error_signal.emit(str(e))
         except Exception as e:
+            tb = traceback.format_exc()
+            bot_logger.error(f"BotWorker: ошибка при создании TradingBot: {e}\n{tb}")
             self.error_signal.emit(str(e))
         finally:
-            self._loop.close()
+            # Clean shutdown: даём недоотменённым tasks завершиться,
+            # потом аккуратно гасим executor и async-генераторы,
+            # потом закрываем loop. Это критично — без этого после следующего
+            # старта получаем "cannot schedule new futures".
+            try:
+                pending = [t for t in asyncio.all_tasks(self._loop) if not t.done()]
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    self._loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception as e:
+                bot_logger.warning(f"BotWorker: ошибка при cancel pending tasks: {e}")
+            try:
+                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                self._loop.run_until_complete(self._loop.shutdown_default_executor())
+            except Exception:
+                pass
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+            try:
+                self._loop.close()
+            except Exception as e:
+                bot_logger.warning(f"BotWorker: ошибка при закрытии loop: {e}")
             self._loop = None
             self.stopped_signal.emit()
 
@@ -300,12 +355,16 @@ class MainWindow(QMainWindow):
     def _on_stopped(self) -> None:
         self._running = False
         self._set_state(False)
+        # Дожидаемся завершения QThread, чтобы старый event loop / Telethon сессия
+        # успели полностью освободить ресурсы — иначе новый старт ловит race на session-файле.
+        if self._worker is not None:
+            self._worker.wait(3000)
         if self._pending_restart:
             self._pending_restart = False
-            self.start_bot()
+            QTimer.singleShot(1500, self.start_bot)  # небольшая пауза для надёжности
         elif not self._user_stop_requested:
-            bot_logger.warning("⚠️ Бот остановился неожиданно. Автоперезапуск через 5 секунд...")
-            QTimer.singleShot(5000, self.start_bot)
+            bot_logger.warning("⚠️ Бот остановился неожиданно. Автоперезапуск через 8 секунд...")
+            QTimer.singleShot(8000, self.start_bot)
 
     # ------------------------------------------------------------------ Состояние UI
 

@@ -134,19 +134,24 @@ class TradingBot:
         try:
             # Запускаем все фоновые задачи параллельно
             await asyncio.gather(
-                server.serve(), 
-                self.client.start(), 
+                server.serve(),
+                self.client.start(),
                 self.exchange.monitor_fills(),
+                self.exchange._instruments_refresh_loop(),  # периодическое обновление лимитов
                 self.notifier.start_polling(),
-                self._signal_worker() # Запуск фонового воркера очереди
+                self._signal_worker()  # Запуск фонового воркера очереди
             )
         except asyncio.CancelledError:
             bot_logger.info("Задачи были отменены (остановка работы).")
         except Exception as e:
-            bot_logger.error(f"Критическая ошибка в main loop: {e}")
+            import traceback
+            bot_logger.error(f"Критическая ошибка в main loop: {e}\n{traceback.format_exc()}")
         finally:
             bot_logger.info("📴 Системы останавливаются...")
-            await self.client.disconnect()
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                bot_logger.warning(f"Ошибка при disconnect Telethon: {e}")
             bot_logger.info("🛑 РАБОТА ЗАВЕРШЕНА: Бот полностью остановлен.")
 
 
