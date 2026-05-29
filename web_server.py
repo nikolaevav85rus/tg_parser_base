@@ -124,7 +124,17 @@ async def get_coins():
 async def add_coin(req: Request):
     data = await req.json()
     if app.state.coins and "coin" in data:
-        await app.state.coins.add_coin(data["coin"].upper(), data.get("alias", ""), 1)
+        coin = data["coin"].upper()
+        alias = data.get("alias", "")
+        await app.state.coins.add_coin(coin, alias, 1)
+        # Прогреваем кэш лимитов для новой монеты — не ждём первого сигнала
+        if app.state.exchange:
+            try:
+                target = (alias or coin).upper()
+                await app.state.exchange.refresh_instruments_cache([target])
+                bot_logger.info(f"WEB: обновлены лимиты для {target}")
+            except Exception as e:
+                bot_logger.warning(f"WEB: refresh лимитов для {coin} не удался: {e}")
     return {"status": "ok"}
 
 
@@ -140,6 +150,12 @@ async def update_coin(coin: str, req: Request):
     data = await req.json()
     if app.state.coins and "is_active" in data:
         await app.state.coins.set_active(coin, bool(data["is_active"]))
+        # Если активируем — прогреем кэш
+        if data["is_active"] and app.state.exchange:
+            try:
+                await app.state.exchange.refresh_instruments_cache([coin.upper()])
+            except Exception as e:
+                bot_logger.warning(f"WEB: refresh лимитов для {coin} не удался: {e}")
     return {"status": "ok"}
 
 

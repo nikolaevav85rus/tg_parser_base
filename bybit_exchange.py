@@ -6,8 +6,9 @@
 
 import math
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, Set
+from typing import TYPE_CHECKING, Dict, Any, Tuple, Optional, Set, List
 
 # Время последнего успешного ответа биржи — читается из GUI-потока (GIL-safe)
 last_api_ok: Optional[datetime] = None
@@ -17,10 +18,24 @@ import aiosqlite
 
 import config
 from database import TradesDatabase, SettingsDatabase, CoinsDatabase
+from database.trades import (
+    ROLE_OPEN, ROLE_DCA, ROLE_TP,
+    ORDER_ACTIVE, ORDER_FILLED, ORDER_CANCELLED, ORDER_REPLACED,
+)
 from logger import bot_logger
 
 if TYPE_CHECKING:
     from notifier import Notifier
+
+
+@dataclass
+class InstrumentInfo:
+    """Параметры торгового инструмента Bybit (lotSizeFilter + priceFilter)."""
+    qty_step: float
+    tick_size: float
+    max_mkt_qty: float       # лимит market-ордера (lotSizeFilter.maxMktOrderQty)
+    max_order_qty: float     # лимит limit-ордера (lotSizeFilter.maxOrderQty)
+    min_order_qty: float
 
 
 class BybitExchange:
@@ -43,13 +58,16 @@ class BybitExchange:
         
         self.trade_limit = initial_limit
         self.active_positions: Dict[str, Dict[str, Any]] = {}
-        self.instrument_info_cache: Dict[str, float] = {}
-        self.price_step_cache: Dict[str, float] = {}
+        self.instruments: Dict[str, InstrumentInfo] = {}
         self.leverage_cache: Dict[str, int] = {}
         self.live_stats: Dict[str, Dict[str, float]] = {}
 
         self._api_error_streak: int = 0
         self._api_disconnected: bool = False
+
+        # Счётчик циклов мониторинга для grace-period перед STUCK
+        # ключ = (trade_id, role), значение = число циклов с mix FILLED+ACTIVE
+        self._stuck_counters: Dict[Tuple[int, str], int] = {}
 
         bot_logger.info("Биржевой модуль BybitExchange инициализирован.")
 
@@ -58,6 +76,44 @@ class BybitExchange:
         saved_limit = await self.settings.get("trade_limit")
         if saved_limit:
             self.trade_limit = float(saved_limit)
+
+        # Прелоад кэша инструментов: при первом сигнале на лимиты не идём в API
+        try:
+            coins_rows = await self.coins_db.get_all()
+            active = [c['alias'] or c['coin'] for c in coins_rows if c.get('is_active')]
+            if active:
+                await self.refresh_instruments_cache(active)
+        except Exception as e:
+            bot_logger.error(f"EXCHANGE: прелоад инструментов не удался: {e}")
+
+    async def refresh_instruments_cache(self, coins: List[str]) -> None:
+        """Параллельно перечитать параметры инструментов с биржи."""
+        if not coins:
+            return
+        results = await asyncio.gather(
+            *(self._fetch_instrument(c) for c in coins),
+            return_exceptions=True
+        )
+        ok = sum(1 for r in results if isinstance(r, InstrumentInfo))
+        fail = len(coins) - ok
+        if fail:
+            bot_logger.warning(
+                f"EXCHANGE: refresh инструментов — {ok}/{len(coins)} успешно, {fail} ошибок"
+            )
+        else:
+            bot_logger.info(f"Кэш инструментов прогрет: {ok} монет")
+
+    async def _instruments_refresh_loop(self) -> None:
+        """Фоновое обновление кэша лимитов раз в config.INSTRUMENTS_REFRESH_INTERVAL_SEC."""
+        while True:
+            await asyncio.sleep(config.INSTRUMENTS_REFRESH_INTERVAL_SEC)
+            try:
+                coins_rows = await self.coins_db.get_all()
+                active = [c['alias'] or c['coin'] for c in coins_rows if c.get('is_active')]
+                if active:
+                    await self.refresh_instruments_cache(active)
+            except Exception as e:
+                bot_logger.error(f"EXCHANGE: периодический refresh не удался: {e}")
 
     async def _get_dca_grid(self) -> Dict[str, Any]:
         """Загрузка динамических настроек сетки DCA и Take Profit из базы данных."""
@@ -176,16 +232,44 @@ class BybitExchange:
                 for p in res['result']['list'] if float(p['size']) > 0
             }
 
-    async def _get_instrument_info(self, symbol: str) -> Tuple[float, float]:
-        if symbol not in self.instrument_info_cache or symbol not in self.price_step_cache:
-            res = await self._api_call(self.session.get_instruments_info, category="linear", symbol=symbol)
-            if res.get('retCode') == 0 and res.get('result', {}).get('list'):
-                info = res['result']['list'][0]
-                self.instrument_info_cache[symbol] = float(info['lotSizeFilter']['qtyStep'])
-                self.price_step_cache[symbol] = float(info['priceFilter']['tickSize'])
-            else:
-                return 0.001, 0.01
-        return self.instrument_info_cache[symbol], self.price_step_cache[symbol]
+    async def _get_instrument_info(self, symbol: str) -> InstrumentInfo:
+        """Параметры инструмента: при отсутствии в кэше — однократный запрос к бирже."""
+        if symbol not in self.instruments:
+            await self._fetch_instrument(symbol)
+        return self.instruments.get(symbol) or InstrumentInfo(
+            qty_step=0.001, tick_size=0.01,
+            max_mkt_qty=0.0, max_order_qty=0.0, min_order_qty=0.0,
+        )
+
+    async def _fetch_instrument(self, symbol: str) -> Optional[InstrumentInfo]:
+        """Однократный запрос параметров инструмента, заполняет кэш."""
+        res = await self._api_call(
+            self.session.get_instruments_info, category="linear", symbol=symbol
+        )
+        if res.get('retCode') != 0:
+            return None
+        lst = res.get('result', {}).get('list', [])
+        if not lst:
+            return None
+        info = lst[0]
+        lot = info.get('lotSizeFilter', {}) or {}
+        prc = info.get('priceFilter', {}) or {}
+        try:
+            max_order_qty = float(lot.get('maxOrderQty', 0) or 0)
+            # У некоторых линейных перпов maxMktOrderQty отсутствует — используем maxOrderQty
+            max_mkt_qty = float(lot.get('maxMktOrderQty', max_order_qty) or max_order_qty)
+            instrument = InstrumentInfo(
+                qty_step=float(lot.get('qtyStep', 0.001) or 0.001),
+                tick_size=float(prc.get('tickSize', 0.01) or 0.01),
+                max_mkt_qty=max_mkt_qty,
+                max_order_qty=max_order_qty,
+                min_order_qty=float(lot.get('minOrderQty', 0) or 0),
+            )
+        except (TypeError, ValueError) as e:
+            bot_logger.warning(f"EXCHANGE: не удалось распарсить параметры {symbol}: {e}")
+            return None
+        self.instruments[symbol] = instrument
+        return instrument
 
     def _round_value(self, value: float, step: float) -> float:
         precision = int(abs(math.log10(step))) if step < 1 else 0
@@ -195,6 +279,47 @@ class BybitExchange:
         amount_usdt = deposit * (percent / 100.0)
         qty = (amount_usdt * leverage) / price
         return self._round_value(qty, qty_step)
+
+    def _split_qty(
+        self,
+        total: float,
+        max_per_order: float,
+        step: float,
+        min_qty: float = 0.0,
+    ) -> List[float]:
+        """
+        Разбивает qty на чанки ≤ max_per_order, каждый кратный step.
+        Сумма чанков = total (с точностью до step).
+        Если последний чанк < min_qty — сливается с предыдущим (если влезает в max).
+        Если total ≤ max_per_order — возвращает [total].
+        """
+        total = self._round_value(total, step)
+        if total <= 0:
+            return []
+        if max_per_order <= 0 or total <= max_per_order:
+            return [total]
+
+        n = math.ceil(total / max_per_order)
+        base = self._round_value(total / n, step)
+        if base <= 0:
+            return [total]
+        # На случай если округление вверх вытолкнуло base за max — снижаем до max и пересчитываем
+        if base > max_per_order:
+            base = self._round_value(max_per_order, step)
+            n = math.ceil(total / base) if base > 0 else 1
+
+        chunks: List[float] = [base] * (n - 1)
+        last = self._round_value(total - base * (n - 1), step)
+        if last <= 0:
+            return chunks
+        # Если хвост < min_qty — слить с предыдущим, если это не выходит за max
+        if min_qty and chunks and last < min_qty:
+            merged = self._round_value(chunks[-1] + last, step)
+            if merged <= max_per_order:
+                chunks[-1] = merged
+                return chunks
+        chunks.append(last)
+        return chunks
 
     async def _place_limit(self, symbol: str, side: str, qty: float, price: float, reduce_only: bool = False) -> Dict[str, Any]:
         return await self._api_call(
@@ -273,6 +398,271 @@ class BybitExchange:
         # API возвращает отрицательное значение при списании — переводим в положительный расход
         return -total
 
+    async def _sync_position_from_exchange(
+        self, symbol: str
+    ) -> Tuple[float, float, float]:
+        """
+        Реальное состояние позиции с биржи: (size, avg_price, position_value).
+        Источник истины вместо самостоятельного расчёта средней цены.
+        """
+        res = await self._api_call(self.session.get_positions, category="linear", symbol=symbol)
+        if res.get('retCode') == 0 and res.get('result', {}).get('list'):
+            try:
+                p = res['result']['list'][0]
+                size = float(p.get('size', 0) or 0)
+                avg = float(p.get('avgPrice', 0) or 0)
+                val = float(p.get('positionValue', 0) or 0)
+                if val <= 0 and size > 0 and avg > 0:
+                    val = size * avg
+                return size, avg, val
+            except (TypeError, ValueError, IndexError):
+                pass
+        return 0.0, 0.0, 0.0
+
+    async def _fetch_realized_pnl(
+        self, symbol: str, since_iso: str
+    ) -> Tuple[float, float, float, float]:
+        """
+        Суммирует РЕАЛЬНЫЕ закрытия позиции с биржи за период [since_iso..now]
+        через get_closed_pnl. Устойчиво к частичным TP (несколько закрытий одной сделки).
+
+        Возвращает (gross_pnl, total_fee, net_closed, last_exit_price):
+          net_closed = Σ closedPnl            (нетто после комиссий, как считает биржа)
+          gross_pnl  = Σ(cumExitValue − cumEntryValue)  (ценовая разница до комиссий)
+          total_fee  = gross_pnl − net_closed (суммарная комиссия open+close)
+        """
+        try:
+            dt = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            start_ms = int(dt.timestamp() * 1000)
+            end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        except Exception as e:
+            bot_logger.warning(f"EXCHANGE: _fetch_realized_pnl парсинг даты '{since_iso}': {e}")
+            return 0.0, 0.0, 0.0, 0.0
+
+        gross = 0.0
+        net_closed = 0.0
+        last_exit = 0.0
+        last_ts = 0
+        cursor: Optional[str] = None
+        for _ in range(10):
+            params: Dict[str, Any] = {
+                "category": "linear", "symbol": symbol,
+                "startTime": start_ms, "endTime": end_ms, "limit": 100,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            res = await self._api_call(self.session.get_closed_pnl, **params)
+            if res.get('retCode') != 0:
+                break
+            result = res.get('result', {}) or {}
+            items = result.get('list', []) or []
+            for it in items:
+                try:
+                    net_closed += float(it.get('closedPnl', 0) or 0)
+                    gross += float(it.get('cumExitValue', 0) or 0) - float(it.get('cumEntryValue', 0) or 0)
+                    ts = int(it.get('updatedTime', 0) or 0)
+                    if ts >= last_ts:
+                        last_ts = ts
+                        last_exit = float(it.get('avgExitPrice', 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+            cursor = result.get('nextPageCursor') or None
+            if not cursor or len(items) < 100:
+                break
+
+        total_fee = gross - net_closed
+        return gross, total_fee, net_closed, last_exit
+
+    # ------------------------------------------------------------------
+    # Chunked helpers (разбивка ордеров на куски по лимитам инструмента)
+    # ------------------------------------------------------------------
+
+    async def _place_market_chunked(
+        self,
+        symbol: str,
+        side: str,
+        total_qty: float,
+        reduce_only: bool = False,
+    ) -> List[str]:
+        """
+        Один или несколько market-ордеров. Возвращает список order_id успешно
+        выставленных ордеров. При retCode != 0 — алёрт в TG и обрыв серии.
+        """
+        instrument = await self._get_instrument_info(symbol)
+        chunks = self._split_qty(
+            total_qty,
+            instrument.max_mkt_qty if instrument.max_mkt_qty > 0 else total_qty,
+            instrument.qty_step,
+            min_qty=instrument.min_order_qty,
+        )
+        if not chunks:
+            return []
+        if len(chunks) > 1:
+            bot_logger.info(
+                f"Чанкинг {symbol} {side} MARKET: qty={total_qty} разбит на {len(chunks)}: {chunks}"
+            )
+        order_ids: List[str] = []
+        for i, chunk in enumerate(chunks):
+            res = await self._api_call(
+                self.session.place_order,
+                category="linear", symbol=symbol, side=side,
+                orderType="Market", qty=str(chunk),
+                reduceOnly=reduce_only,
+            )
+            if res.get("retCode") == 0 and res.get("result", {}).get("orderId"):
+                order_ids.append(res["result"]["orderId"])
+            else:
+                msg = f"⚠️ Ордер не выставлен: {symbol} {side} MARKET {chunk} — {res.get('retMsg', '?')} (код {res.get('retCode')})"
+                bot_logger.error(msg)
+                try:
+                    await self.notifier.send(msg)
+                except Exception:
+                    pass
+                break  # серия прервана: остаток не отправляем
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.1)  # rate-limit запас
+        return order_ids
+
+    async def _place_limit_chunked(
+        self,
+        symbol: str,
+        side: str,
+        total_qty: float,
+        price: float,
+        reduce_only: bool = False,
+    ) -> List[str]:
+        """Один или несколько limit-ордеров на одну цену. List[order_id]."""
+        instrument = await self._get_instrument_info(symbol)
+        chunks = self._split_qty(
+            total_qty,
+            instrument.max_order_qty if instrument.max_order_qty > 0 else total_qty,
+            instrument.qty_step,
+            min_qty=instrument.min_order_qty,
+        )
+        if not chunks:
+            return []
+        if len(chunks) > 1:
+            bot_logger.info(
+                f"Чанкинг {symbol} {side} LIMIT @ {price}: qty={total_qty} разбит на {len(chunks)}: {chunks}"
+            )
+        order_ids: List[str] = []
+        for i, chunk in enumerate(chunks):
+            res = await self._place_limit(symbol, side, chunk, price, reduce_only=reduce_only)
+            if res.get("retCode") == 0 and res.get("result", {}).get("orderId"):
+                order_ids.append(res["result"]["orderId"])
+            else:
+                msg = f"⚠️ Ордер не выставлен: {symbol} {side} LIMIT {chunk}@{price} — {res.get('retMsg', '?')} (код {res.get('retCode')})"
+                bot_logger.error(msg)
+                try:
+                    await self.notifier.send(msg)
+                except Exception:
+                    pass
+                break
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.1)
+        return order_ids
+
+    async def _cancel_orders_safe(self, symbol: str, order_ids: List[str]) -> None:
+        """Безопасная отмена набора ордеров — последовательная, с игнором ошибок (уже отменён и т.п.)."""
+        for oid in order_ids:
+            if not oid:
+                continue
+            try:
+                await self._api_call(
+                    self.session.cancel_order, category="linear", symbol=symbol, orderId=oid
+                )
+            except Exception as e:
+                bot_logger.warning(f"EXCHANGE: не удалось отменить {symbol} {oid}: {e}")
+
+    async def _get_aggregated_execution_data(
+        self,
+        symbol: str,
+        order_ids: List[str],
+        since_iso: Optional[str] = None,
+    ) -> Tuple[Optional[float], Optional[float], float]:
+        """
+        Агрегирует execution data по списку order_ids: avg_p (взвешенная), total_value, total_fee.
+        Один запрос get_executions по символу за период, фильтрация по orderId в Python.
+        """
+        if not order_ids:
+            return None, None, 0.0
+        await asyncio.sleep(config.EXEC_DATA_DELAY)
+
+        target = set(order_ids)
+        params: Dict[str, Any] = {"category": "linear", "symbol": symbol, "limit": 100}
+        if since_iso:
+            try:
+                dt = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                params["startTime"] = int(dt.timestamp() * 1000)
+            except Exception:
+                pass
+
+        total_q = 0.0
+        total_v = 0.0
+        total_f = 0.0
+        cursor: Optional[str] = None
+        for _ in range(10):
+            if cursor:
+                params["cursor"] = cursor
+            res = await self._api_call(self.session.get_executions, **params)
+            if res.get('retCode') != 0:
+                break
+            result = res.get('result', {}) or {}
+            items = result.get('list', []) or []
+            for ex in items:
+                if ex.get('orderId') not in target:
+                    continue
+                try:
+                    total_q += float(ex.get('execQty', 0) or 0)
+                    total_v += float(ex.get('execValue', 0) or 0)
+                    total_f += float(ex.get('execFee', 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+            cursor = result.get('nextPageCursor') or None
+            if not cursor or len(items) < 100:
+                break
+
+        if total_q > 0:
+            return total_v / total_q, total_v, total_f
+        return None, None, total_f
+
+    async def _classify_orders(
+        self, symbol: str, order_ids: List[str]
+    ) -> Dict[str, str]:
+        """
+        Определить финальный статус ордеров через get_order_history.
+        Возвращает {order_id: статус Bybit}, например 'Filled' / 'Cancelled' /
+        'PartiallyFilled' / 'New'. Если не нашли — 'Unknown'.
+        """
+        if not order_ids:
+            return {}
+        result_map: Dict[str, str] = {oid: 'Unknown' for oid in order_ids}
+        target = set(order_ids)
+        params: Dict[str, Any] = {"category": "linear", "symbol": symbol, "limit": 50}
+        cursor: Optional[str] = None
+        for _ in range(5):
+            if cursor:
+                params["cursor"] = cursor
+            res = await self._api_call(self.session.get_order_history, **params)
+            if res.get('retCode') != 0:
+                break
+            result = res.get('result', {}) or {}
+            items = result.get('list', []) or []
+            for o in items:
+                oid = o.get('orderId')
+                if oid in target:
+                    result_map[oid] = o.get('orderStatus') or 'Unknown'
+            if all(v != 'Unknown' for v in result_map.values()):
+                return result_map
+            cursor = result.get('nextPageCursor') or None
+            if not cursor or len(items) < 50:
+                break
+        return result_map
+
     async def execute_signal(self, coin: str, signal_type: str, signal_price: float, target_price: float) -> None:
         bot_logger.info(f"⚡ ТОРГОВЫЙ МОДУЛЬ: Получена команда {signal_type} для {coin}")
         
@@ -308,53 +698,61 @@ class BybitExchange:
         grid = await self._get_dca_grid()
         leverage = int(await self.settings.get("leverage", str(config.LEVERAGE)))
         deposit = float(await self.settings.get("trade_limit", str(self.trade_limit)))
-        
+
         await self._ensure_leverage(coin, leverage)
-        
+
         try:
             res = await self._api_call(self.session.get_tickers, category="linear", symbol=coin)
-            if res.get('retCode') != 0: 
+            if res.get('retCode') != 0:
                 return
-            
+
             price = float(res['result']['list'][0]['lastPrice'])
-            qty_step, price_step = await self._get_instrument_info(coin)
-            
+            instrument = await self._get_instrument_info(coin)
+            qty_step = instrument.qty_step
+            price_step = instrument.tick_size
+
             qty = self._calc_qty(deposit, grid["volumes"][0], leverage, price, qty_step)
-            if qty <= 0: 
+            if qty <= 0:
                 return
 
-            order = await self._api_call(
-                self.session.place_order, 
-                category="linear", symbol=coin, side="Buy", orderType="Market", qty=str(qty)
+            # === MARKET-вход (с разбивкой на чанки если qty > maxMktOrderQty) ===
+            open_ids = await self._place_market_chunked(coin, "Buy", qty)
+            if not open_ids:
+                bot_logger.error(f"Ошибка OPEN {coin}: ни один чанк market-входа не выставлен")
+                return
+
+            real_p, real_inv, exec_fee = await self._get_aggregated_execution_data(coin, open_ids)
+            real_p = real_p or price
+            real_inv = real_inv or (qty * price)
+
+            trade_id = await self.db.create_trade(coin, real_p, real_inv, 0.0, leverage, exec_fee)
+            # OPEN-ордера market исполнились сразу — фиксируем как FILLED
+            await self.db.add_orders(trade_id, ROLE_OPEN, open_ids, qty=qty)
+            await self.db.mark_orders_status(open_ids, ORDER_FILLED)
+
+            bot_logger.info(f"Исполнен вход {coin}. Цена: {real_p}. trade_id={trade_id}")
+
+            # === LIMIT TP (с разбивкой если qty > maxOrderQty) ===
+            tp_price = self._round_value(real_p * (1 + grid["tp_target"] / 100.0), price_step)
+            tp_ids = await self._place_limit_chunked(coin, "Sell", qty, tp_price, reduce_only=True)
+            if tp_ids:
+                await self.db.add_orders(trade_id, ROLE_TP, tp_ids, qty=qty)
+
+            # === LIMIT DCA-1 ===
+            allow_dca = await self.settings.get("allow_dca", "False") == "True"
+            dca1_price = self._round_value(real_p * (1 - grid["levels"][0] / 100.0), price_step)
+
+            if allow_dca:
+                dca1_qty = self._calc_qty(deposit, grid["volumes"][1], leverage, dca1_price, qty_step)
+                dca_ids = await self._place_limit_chunked(coin, "Buy", dca1_qty, dca1_price)
+                if dca_ids:
+                    await self.db.add_orders(trade_id, ROLE_DCA, dca_ids, step=1, qty=dca1_qty)
+
+            await self.notifier.send(
+                f"🟢 <b>ВХОД: {coin}</b>\nЦена: {real_p}\nОбъем: {real_inv:.2f} USDT\n"
+                f"TP: {tp_price}\nПлановый DCA_1: {dca1_price}"
             )
-            
-            if order.get('retCode') == 0:
-                order_id = order['result']['orderId']
-                
-                real_p, real_inv, exec_fee = await self._get_real_execution_data(order_id, coin)
-                real_p = real_p or price
-                real_inv = real_inv or (qty * price)
-                
-                await self.db.create_trade(coin, real_p, real_inv, 0.0, leverage, exec_fee)
-                bot_logger.info(f"Исполнен вход {coin}. Цена: {real_p}.")
-
-                tp_price = self._round_value(real_p * (1 + grid["tp_target"] / 100.0), price_step)
-                tp_order = await self._place_limit(coin, "Sell", qty, tp_price, reduce_only=True)
-                if tp_order.get("retCode") == 0:
-                    await self.db.set_tp_order_id(coin, tp_order["result"]["orderId"])
-
-                # Проверка тумблера "Разрешить усреднения" перед первым DCA
-                allow_dca = await self.settings.get("allow_dca", "False") == "True"
-                dca1_price = self._round_value(real_p * (1 - grid["levels"][0] / 100.0), price_step)
-                
-                if allow_dca:
-                    dca1_qty = self._calc_qty(deposit, grid["volumes"][1], leverage, dca1_price, qty_step)
-                    dca_order = await self._place_limit(coin, "Buy", dca1_qty, dca1_price)
-                    if dca_order.get("retCode") == 0:
-                        await self.db.set_dca_order_id(coin, dca_order["result"]["orderId"])
-
-                await self.notifier.send(f"🟢 <b>ВХОД: {coin}</b>\nЦена: {real_p}\nОбъем: {real_inv:.2f} USDT\nTP: {tp_price}\nПлановый DCA_1: {dca1_price}")
-                await self.load_active_positions()
+            await self.load_active_positions()
         except Exception as e:
             bot_logger.error(f"Ошибка OPEN {coin}: {e}")
 
@@ -370,86 +768,258 @@ class BybitExchange:
                 bot_logger.error(f"Ошибка мониторинга: {e}")
 
     async def _process_trade_fills(self, trade: aiosqlite.Row) -> None:
+        """
+        Детектирует исполнение TP / DCA с учётом множественных chunked-ордеров.
+        Различает FILLED и CANCELLED через get_order_history. Закрывает сделку только
+        когда ВСЕ TP-чанки перешли в FILLED/CANCELLED. При зависании > STUCK_GRACE_CYCLES
+        — сделка переходит в STUCK + алёрт.
+        """
         coin = trade["coin"]
-        open_order_ids = await self._get_open_order_ids(coin)
+        trade_id = trade["id"]
+        open_ids = await self._get_open_order_ids(coin)
 
-        if trade["tp_order_id"] and trade["tp_order_id"] not in open_order_ids:
-            await self._process_tp_execution(trade, coin)
+        # Проверяем TP, затем DCA. Если TP исполнен — DCA уже не важен (сделка закрывается).
+        for role in (ROLE_TP, ROLE_DCA):
+            active_rows = await self.db.get_active_orders(trade_id, role)
+            if not active_rows:
+                continue
+
+            active_ids = [r['order_id'] for r in active_rows]
+            gone_ids = [oid for oid in active_ids if oid not in open_ids]
+            if not gone_ids:
+                # Все ACTIVE по этой роли всё ещё в open — ничего не делаем
+                self._stuck_counters.pop((trade_id, role), None)
+                continue
+
+            # Классифицируем "ушедшие" из open_orders
+            statuses = await self._classify_orders(coin, gone_ids)
+            filled = [oid for oid, s in statuses.items() if s == 'Filled']
+            cancelled = [
+                oid for oid, s in statuses.items()
+                if s in ('Cancelled', 'Rejected', 'Deactivated')
+            ]
+            unknown = [
+                oid for oid, s in statuses.items()
+                if oid not in filled and oid not in cancelled
+            ]
+
+            if cancelled:
+                await self.db.mark_orders_status(cancelled, ORDER_CANCELLED)
+                msg = (
+                    f"⚠️ {coin}: {role}-ордера отменены вне бота ({len(cancelled)} шт.) — "
+                    f"возможно ручное вмешательство"
+                )
+                bot_logger.warning(msg)
+                try:
+                    await self.notifier.send(msg)
+                except Exception:
+                    pass
+            if filled:
+                await self.db.mark_orders_status(filled, ORDER_FILLED)
+
+            # Состояние после обновления: сколько ACTIVE осталось по роли
+            remaining = await self.db.get_active_orders(trade_id, role)
+
+            if not remaining and filled:
+                # Все ордера роли в финальном статусе и хотя бы один исполнен → процессим
+                self._stuck_counters.pop((trade_id, role), None)
+                if role == ROLE_TP:
+                    await self._process_tp_execution(trade, coin, filled)
+                    return  # сделка закрыта
+                elif role == ROLE_DCA:
+                    await self._process_dca_execution(trade, coin, filled)
+                    return  # после DCA-roll выходим — следующая итерация monitor проверит свежее состояние
+            elif remaining and filled:
+                # Частичное исполнение: есть и FILLED, и оставшиеся ACTIVE — это аномалия
+                key = (trade_id, role)
+                self._stuck_counters[key] = self._stuck_counters.get(key, 0) + 1
+                if self._stuck_counters[key] >= config.STUCK_GRACE_CYCLES:
+                    bot_logger.error(
+                        f"🔴 {coin}: {role} частично исполнен ({len(filled)} FILLED, "
+                        f"{len(remaining)} ACTIVE) > {config.STUCK_GRACE_CYCLES} циклов → STUCK"
+                    )
+                    await self.db.set_trade_status(coin, 'STUCK')
+                    try:
+                        await self.notifier.send(
+                            f"🔴 <b>STUCK: {coin}</b>\nЧастичное исполнение {role}: "
+                            f"{len(filled)} FILLED + {len(remaining)} ACTIVE.\nТребуется ручное вмешательство."
+                        )
+                    except Exception:
+                        pass
+                    self._stuck_counters.pop(key, None)
+            elif unknown and not filled:
+                # Все ушли, но статусы непонятны — подождём следующий цикл (BybitAPI лагает)
+                bot_logger.debug(
+                    f"{coin} {role}: {len(unknown)} ордеров со статусом Unknown — повтор на след. цикле"
+                )
+
+    async def _process_tp_execution(
+        self, trade: aiosqlite.Row, coin: str, tp_filled_ids: List[str]
+    ) -> None:
+        """Закрытие сделки по TP. PnL берётся реально с биржи (Σ closedPnl)."""
+        if not tp_filled_ids:
             return
+        await self._finalize_closed_trade(trade, coin, reason="TP")
 
-        if trade["dca_order_id"] and trade["dca_order_id"] not in open_order_ids:
-            await self._process_dca_execution(trade, coin)
+    async def _finalize_closed_trade(
+        self, trade: aiosqlite.Row, coin: str, reason: str = "TP"
+    ) -> None:
+        """
+        Финализирует закрытую сделку. БИРЖА — ИСТОЧНИК ИСТИНЫ:
+        net_pnl = Σ closedPnl за период сделки − фандинг. Корректно учитывает
+        частичные TP (несколько закрытий одной сделки) и любые расхождения учёта.
 
-    async def _process_tp_execution(self, trade: aiosqlite.Row, coin: str) -> None:
-        res_p, _, fee = await self._get_real_execution_data(trade["tp_order_id"], coin)
-        if res_p:
-            funding_fee = await self._fetch_funding_fee(coin, trade["created_at"])
-            _, _, net_pnl = await self.db.close_trade(coin, res_p, fee, funding_fee)
-            await self._cancel_order_safe(coin, trade["dca_order_id"])
+        ВАЖНО: перед закрытием проверяем, что позиция на бирже реально опустела.
+        Если TP закрыл не весь объём (округление qty / частичное исполнение) —
+        НЕ списываем сделку, а перевыставляем TP на оставшийся объём.
+        """
+        trade_id = trade['id']
 
-            bot_logger.info(f"✅ TP Исполнен {coin}. PNL: ${net_pnl:.2f} (funding: ${funding_fee:.4f})")
-            await self.notifier.send(f"✅ <b>TP: {coin}</b>\nЦена: {res_p}\nNet PNL: <b>{net_pnl:.2f}$</b>")
+        # Даём бирже зафиксировать исполнение и читаем реальный остаток позиции
+        await asyncio.sleep(config.EXEC_DATA_DELAY)
+        size, avg, value = await self._sync_position_from_exchange(coin)
+        instrument = await self._get_instrument_info(coin)
+        min_qty = instrument.min_order_qty
+
+        # Остаток считается торгуемым, если size >= minOrderQty (или minOrderQty неизвестен).
+        # Меньший остаток = «пыль», его нельзя выставить лимитным ордером — игнорируем.
+        remainder_tradeable = size > 0 and (size >= min_qty if min_qty > 0 else True)
+
+        # Позиция НЕ закрыта полностью — перевыставляем TP на остаток
+        if remainder_tradeable and avg > 0:
+            grid = await self._get_dca_grid()
+            price_step = instrument.tick_size
+            new_tp = self._round_value(avg * (1 + grid["tp_target"] / 100.0), price_step)
+
+            new_tp_ids = await self._place_limit_chunked(
+                coin, "Sell", size, new_tp, reduce_only=True
+            )
+            old_tp_ids = await self.db.replace_active_orders(
+                trade_id, ROLE_TP, new_tp_ids, qty=size
+            )
+            if old_tp_ids:
+                await self._cancel_orders_safe(coin, old_tp_ids)
+            # Синхронизируем учёт с реальным остатком
+            await self.db.sync_position(coin, int(trade["step"]), avg, value)
+
+            msg = (
+                f"⚠️ {coin}: TP закрыл не весь объём, остаток size={size} "
+                f"перевыставлен на TP @ {new_tp}"
+            )
+            bot_logger.warning(msg)
+            try:
+                await self.notifier.send(
+                    f"⚠️ <b>{coin}</b>: частичное закрытие.\n"
+                    f"Остаток {size} перевыставлен на TP @ {new_tp}"
+                )
+            except Exception:
+                pass
             await self.load_active_positions()
+            return  # сделку НЕ закрываем — ждём добивания остатка
 
-    async def _process_dca_execution(self, trade: aiosqlite.Row, coin: str) -> None:
-        filled_p, filled_inv, fee = await self._get_real_execution_data(trade["dca_order_id"], coin)
-        if not filled_p: 
+        # === Позиция реально пуста (или остаток ниже minOrderQty = пыль) → финализируем ===
+
+        # Отменяем все оставшиеся ACTIVE-ордера сделки (DCA/TP-остатки)
+        active = await self.db.get_active_orders(trade_id)
+        if active:
+            ids = [r['order_id'] for r in active]
+            await self._cancel_orders_safe(coin, ids)
+            await self.db.mark_orders_status(ids, ORDER_CANCELLED)
+
+        gross, total_fee, net_closed, last_exit = await self._fetch_realized_pnl(
+            coin, trade["created_at"]
+        )
+        funding_fee = await self._fetch_funding_fee(coin, trade["created_at"])
+        # closedPnl Bybit УЖЕ включает все комиссии И фандинг — это финальный net.
+        # Фандинг тянем отдельно ТОЛЬКО для разбивки O/F/C в дашборде, НЕ вычитаем повторно.
+        net_pnl = net_closed
+
+        exit_price = last_exit or trade["avg_p"] or 0.0
+        await self.db.close_trade_realized(coin, exit_price, gross, net_pnl, funding_fee)
+
+        dust_note = f", пыль size={size} проигнорирована" if size > 0 else ""
+        bot_logger.info(
+            f"✅ Закрыта {coin} ({reason}). Net PNL: ${net_pnl:.2f} "
+            f"(gross ${gross:.2f}, fee ${total_fee:.2f} вкл. funding ${funding_fee:.4f}{dust_note})"
+        )
+        await self.notifier.send(
+            f"✅ <b>Закрыта: {coin}</b>\nЦена выхода: {exit_price}\nNet PNL: <b>{net_pnl:.2f}$</b>"
+        )
+        await self.load_active_positions()
+
+    async def _process_dca_execution(
+        self, trade: aiosqlite.Row, coin: str, dca_filled_ids: List[str]
+    ) -> None:
+        """Обработка исполнения DCA-чанков на одном шаге."""
+        if not dca_filled_ids:
             return
-        
-        # Сразу очищаем dca_order_id в базе, чтобы не было "Петли смерти"
-        await self.db.set_dca_order_id(coin, None)
-        
+        filled_p, filled_inv, fee = await self._get_aggregated_execution_data(
+            coin, dca_filled_ids, since_iso=trade["created_at"]
+        )
+        if not filled_p:
+            return
+
+        trade_id = trade['id']
         next_step = int(trade["step"]) + 1
-        
-        await self.db.update_trade_dca(coin, next_step, filled_p, filled_inv, fee)
-        updated = await self.db.get_trading_trade(coin)
-        
-        if not updated:
-            return
 
-        await self._cancel_order_safe(coin, trade["tp_order_id"])
-        
-        qty_step, price_step = await self._get_instrument_info(coin)
+        instrument = await self._get_instrument_info(coin)
+        qty_step = instrument.qty_step
+        price_step = instrument.tick_size
         grid = await self._get_dca_grid()
         leverage = int(trade["leverage"])
         deposit = float(await self.settings.get("trade_limit", str(self.trade_limit)))
-        
-        # --- ИСПРАВЛЕНИЕ: Исключаем "пыль" при закрытии ---
-        # Запрашиваем реальный объем позиции напрямую с биржи
-        real_qty = 0.0
-        pos_res = await self._api_call(self.session.get_positions, category="linear", symbol=coin)
-        
-        if pos_res.get('retCode') == 0 and pos_res.get('result', {}).get('list'):
-            real_qty = float(pos_res['result']['list'][0]['size'])
-            
-        # Если биржа ответила успешно, берем её size. 
-        # Иначе фолбэк на локальный расчет (защита от сбоев API)
-        if real_qty > 0:
-            total_qty = real_qty
-        else:
-            total_qty = self._round_value(updated["total_inv"] / updated["avg_p"], qty_step)
-        # -------------------------------------------------
-        
-        new_tp = self._round_value(updated["avg_p"] * (1 + grid["tp_target"] / 100.0), price_step)
-        tp_res = await self._place_limit(coin, "Sell", total_qty, new_tp, reduce_only=True)
-        if tp_res.get("retCode") == 0:
-            await self.db.set_tp_order_id(coin, tp_res["result"]["orderId"])
-        
-        # Проверка тумблера перед выставлением следующих DCA
+
+        # === БИРЖА — ИСТОЧНИК ИСТИНЫ ===
+        # Берём реальные avgPrice/positionValue/size с биржи вместо самостоятельного
+        # пересчёта средней. Это устойчиво к частичному исполнению TP до DCA.
+        real_qty, real_avg, real_value = await self._sync_position_from_exchange(coin)
+
+        if real_qty <= 0:
+            # Позиция на бирже пуста (например, TP полностью исполнился до DCA, а DCA-ордер
+            # успел частично залиться и тут же закрылся). Закрываем сделку по факту.
+            bot_logger.warning(
+                f"⚠️ DCA {coin}: позиция на бирже пуста (size=0) — закрываю сделку по факту"
+            )
+            await self._finalize_closed_trade(trade, coin)
+            return
+
+        # Синхронизируем БД с реальным состоянием позиции; комиссию DCA-входа копим в open_fee
+        await self.db.sync_position(coin, next_step, real_avg, real_value, add_open_fee=fee)
+        updated = await self.db.get_trading_trade(coin)
+        if not updated:
+            return
+
+        total_qty = real_qty
+
+        # Новый TP по реальной средней цене с биржи
+        new_tp = self._round_value(real_avg * (1 + grid["tp_target"] / 100.0), price_step)
+        new_tp_ids = await self._place_limit_chunked(coin, "Sell", total_qty, new_tp, reduce_only=True)
+
+        # Атомарная замена старых TP на новые; возвращает старые order_ids для отмены на бирже
+        old_tp_ids = await self.db.replace_active_orders(trade_id, ROLE_TP, new_tp_ids, qty=total_qty)
+        if old_tp_ids:
+            await self._cancel_orders_safe(coin, old_tp_ids)
+
+        # Следующий DCA
         allow_dca = await self.settings.get("allow_dca", "False") == "True"
-        
+        next_dca_ids: List[str] = []
         if allow_dca and next_step < config.DCA_MAX_STEPS:
             next_dev = grid["levels"][next_step]
             next_vol = grid["volumes"][next_step + 1]
-            
             next_p = self._round_value(filled_p * (1 - next_dev / 100.0), price_step)
             next_q = self._calc_qty(deposit, next_vol, leverage, next_p, qty_step)
-            
-            dca_res = await self._place_limit(coin, "Buy", next_q, next_p)
-            if dca_res.get("retCode") == 0:
-                await self.db.set_dca_order_id(coin, dca_res["result"]["orderId"])
-        
-        await self.notifier.send(f"⚖️ <b>DCA #{next_step}: {coin}</b>\nОбъем: {filled_inv:.2f} USDT\nСр.цена: {updated['avg_p']:.4f}\nНовый TP: {new_tp}")
+            next_dca_ids = await self._place_limit_chunked(coin, "Buy", next_q, next_p)
+
+        # Все DCA-ордера предыдущих шагов уже FILLED (помечены в monitor). Активные DCA
+        # (если были — для следующего шага) заменяем новыми.
+        await self.db.replace_active_orders(
+            trade_id, ROLE_DCA, next_dca_ids, step=next_step + 1
+        )
+
+        await self.notifier.send(
+            f"⚖️ <b>DCA #{next_step}: {coin}</b>\nОбъем: {filled_inv:.2f} USDT\n"
+            f"Ср.цена: {updated['avg_p']:.4f}\nНовый TP: {new_tp}"
+        )
         await self.load_active_positions()
 
     async def get_active_open_orders(self) -> dict:
@@ -484,8 +1054,13 @@ class BybitExchange:
             if not trade:
                 return {"status": "error", "message": "Активная позиция не найдена в БД"}
 
-            await self._cancel_order_safe(coin, trade["tp_order_id"])
-            await self._cancel_order_safe(coin, trade["dca_order_id"])
+            trade_id = trade['id']
+            # Отменяем все ACTIVE TP/DCA-ордера сделки
+            active = await self.db.get_active_orders(trade_id)
+            active_ids = [r['order_id'] for r in active]
+            if active_ids:
+                await self._cancel_orders_safe(coin, active_ids)
+                await self.db.mark_orders_status(active_ids, ORDER_CANCELLED)
 
             current_price = await self.get_last_price(coin)
 
@@ -493,24 +1068,35 @@ class BybitExchange:
             if pos_res.get('retCode') == 0 and pos_res.get('result', {}).get('list'):
                 size = float(pos_res['result']['list'][0]['size'])
                 if size > 0:
-                    close_order = await self._api_call(
-                        self.session.place_order,
-                        category="linear", symbol=coin, side="Sell", orderType="Market", qty=str(size), reduceOnly=True
+                    # MARKET закрытие с разбивкой
+                    close_ids = await self._place_market_chunked(
+                        coin, "Sell", size, reduce_only=True
                     )
-                    
-                    if close_order.get('retCode') == 0:
-                        close_order_id = close_order['result']['orderId']
-                        real_exit, _, close_fee = await self._get_real_execution_data(close_order_id, coin)
-                        exit_price = real_exit or current_price
-                        funding_fee = await self._fetch_funding_fee(coin, trade["created_at"])
 
-                        _, _, net = await self.db.close_trade(coin, exit_price, close_fee, funding_fee)
+                    if close_ids:
+                        await self.db.add_orders(trade_id, ROLE_TP, close_ids, qty=size)
+                        await self.db.mark_orders_status(close_ids, ORDER_FILLED)
+
+                        # Даём бирже зафиксировать закрытие, затем берём реальный closedPnl
+                        await asyncio.sleep(config.EXEC_DATA_DELAY)
+                        gross, total_fee, net_closed, last_exit = await self._fetch_realized_pnl(
+                            coin, trade["created_at"]
+                        )
+                        funding_fee = await self._fetch_funding_fee(coin, trade["created_at"])
+                        # closedPnl уже включает комиссии и фандинг — финальный net
+                        net = net_closed
+                        exit_price = last_exit or current_price
+
+                        await self.db.close_trade_realized(coin, exit_price, gross, net, funding_fee)
                         await self.load_active_positions()
-                        bot_logger.info(f"🚨 Экстренное закрытие {coin} через WebUI выполнено. PNL: {net:.2f} (fee: ${close_fee:.4f}, funding: ${funding_fee:.4f})")
+                        bot_logger.info(
+                            f"🚨 Экстренное закрытие {coin}: Net PNL: {net:.2f} "
+                            f"(gross ${gross:.2f}, fee+funding ${total_fee:.4f}, чанков: {len(close_ids)})"
+                        )
                         return {"status": "ok", "message": f"Позиция закрыта. PNL: {net:.2f}"}
                     else:
-                        return {"status": "error", "message": close_order.get('retMsg')}
-                        
+                        return {"status": "error", "message": "Не удалось выставить ни один чанк market-закрытия"}
+
             return {"status": "error", "message": "Размер позиции 0 или не удалось получить"}
         except Exception as e:
             bot_logger.error(f"EXCHANGE: Ошибка экстренного закрытия {coin}: {e}")
