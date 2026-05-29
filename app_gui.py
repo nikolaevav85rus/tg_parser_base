@@ -127,12 +127,15 @@ class BotWorker(QThread):
 class MainWindow(QMainWindow):
     _log_signal = pyqtSignal(int, str)
 
+    _MAX_AUTO_RESTARTS = 5  # подряд неудачных автоперезапусков до полной остановки
+
     def __init__(self) -> None:
         super().__init__()
         self._worker: BotWorker | None = None
         self._running = False
         self._pending_restart = False
         self._user_stop_requested = False
+        self._auto_restart_count = 0  # счётчик подряд автоперезапусков (защита от петли)
 
         self._icon = _load_icon()
 
@@ -285,7 +288,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ Бот
 
     def start_bot(self) -> None:
+        # Гард: не плодим воркеры, если уже работает или старый поток ещё жив
         if self._running:
+            return
+        if self._worker is not None and self._worker.isRunning():
+            bot_logger.warning("Старт отклонён: предыдущий поток бота ещё завершается.")
             return
         self._user_stop_requested = False
         self._worker = BotWorker()
@@ -350,6 +357,7 @@ class MainWindow(QMainWindow):
 
     def _on_started(self) -> None:
         self._running = True
+        self._auto_restart_count = 0  # успешный старт сбрасывает счётчик петли
         self._set_state(True)
 
     def _on_stopped(self) -> None:
@@ -359,11 +367,25 @@ class MainWindow(QMainWindow):
         # успели полностью освободить ресурсы — иначе новый старт ловит race на session-файле.
         if self._worker is not None:
             self._worker.wait(3000)
+
         if self._pending_restart:
+            # Явный перезапуск пользователем — счётчик петли не трогаем
             self._pending_restart = False
-            QTimer.singleShot(1500, self.start_bot)  # небольшая пауза для надёжности
+            QTimer.singleShot(1500, self.start_bot)
         elif not self._user_stop_requested:
-            bot_logger.warning("⚠️ Бот остановился неожиданно. Автоперезапуск через 8 секунд...")
+            # Неожиданная остановка. Защита от бесконечной петли старт-падение-старт.
+            self._auto_restart_count += 1
+            if self._auto_restart_count > self._MAX_AUTO_RESTARTS:
+                bot_logger.error(
+                    f"🔴 Бот падает при старте {self._auto_restart_count - 1} раз подряд. "
+                    f"Автоперезапуск ОСТАНОВЛЕН — нужно вмешательство. Запустите вручную «Старт»."
+                )
+                self._auto_restart_count = 0
+                return
+            bot_logger.warning(
+                f"⚠️ Бот остановился неожиданно. Автоперезапуск через 8 секунд "
+                f"(попытка {self._auto_restart_count}/{self._MAX_AUTO_RESTARTS})..."
+            )
             QTimer.singleShot(8000, self.start_bot)
 
     # ------------------------------------------------------------------ Состояние UI
