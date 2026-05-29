@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, Optional
 import aiohttp
 
@@ -126,6 +127,19 @@ class Notifier:
             "/go — Разрешить новые входы"
         )
 
+    @staticmethod
+    def _fmt_msk(iso_s: Optional[str]) -> str:
+        """ISO-строка времени (UTC) → строка в МСК формата ДД.ММ.ГГГГ ЧЧ:ММ."""
+        if not iso_s:
+            return "—"
+        try:
+            dt = datetime.fromisoformat(str(iso_s).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (dt + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(iso_s)
+
     async def _cmd_status(self, uid: int) -> None:
         bybit_ok = await self.exchange_ref.check_connection() if self.exchange_ref else False
         tg_ok = self.tg_client.is_connected() if self.tg_client else False
@@ -146,10 +160,34 @@ class Notifier:
             msg += "🟢 Нет открытых позиций."
             return await self.reply_to_user(uid, msg)
 
-        msg += "📊 <b>Активные позиции:</b>\n\n"
-        for t in open_trades:
-            msg += (f"🔸 <b>{t['coin']}</b> (Шаг {t['step']})\n"
-                    f"Вложено: ${t['total_inv']:.2f} | Ср.цена: {t['avg_p']:.4f}\n\n")
+        # Свежая live-статистика с биржи (unrealisedPnl) для расчёта текущего состояния
+        if self.exchange_ref:
+            try:
+                await self.exchange_ref.fetch_live_stats()
+            except Exception as e:
+                bot_logger.warning(f"Не удалось обновить live_stats для /status: {e}")
+
+        msg += "📊 <b>Ваши открытые позиции:</b>\n\n"
+        for i, t in enumerate(open_trades, 1):
+            coin = t['coin']
+            inv = t['total_inv'] or 0.0
+            avg = t['avg_p'] or 0.0
+            qty = (inv / avg) if avg > 0 else 0.0
+            opened = self._fmt_msk(t['created_at'])
+
+            live = self.exchange_ref.live_stats.get(coin, {}) if self.exchange_ref else {}
+            pnl_usd = float(live.get('unrealisedPnl', 0.0))
+            pnl_pct = (pnl_usd / inv * 100) if inv > 0 else 0.0
+            emoji = "🔴" if pnl_usd < 0 else "🟢"
+
+            msg += (
+                f"{i}. <b>{coin}</b>\n"
+                f"   💰 Маржа: {inv:.2f} USDT\n"
+                f"   📈 Цена входа: {avg:.8f}\n"
+                f"   📊 Количество: {qty:.8f}\n"
+                f"   📅 Открыта: {opened} МСК\n"
+                f"   {emoji} Текущее состояние (≈): {pnl_pct:+.2f}% ({pnl_usd:+.2f} USDT)\n\n"
+            )
         await self.reply_to_user(uid, msg)
 
     async def _cmd_balance(self, uid: int) -> None:
